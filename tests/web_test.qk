@@ -1,0 +1,241 @@
+// web v1.0.0 — routes, middleware, requests / responses, static files,
+// templates through TestClient; then the real server on a local port.
+use web
+use test
+use fs
+use sys
+use net.http
+use net.socket
+use encoding.json
+from net.socket use { Socket }
+
+define test_routes_params_and_wildcards() -> void {
+    app := web.App()
+    app.get("/", fn(req, res) { res.text("home") })
+    app.get("/users/:id", fn(req, res) { res.text("user " + req.params["id"]) })
+    app.get("/users/:id/posts/:post", fn(req, res) { res.text(req.params["id"] + "/" + req.params["post"]) })
+    app.get("/files/*path", fn(req, res) { res.text("file " + req.params["path"]) })
+    app.post("/users", fn(req, res) { res.status(201).text("created") })
+    c := web.TestClient(app)
+    test.assert_eq(c.get("/").body, "home")
+    test.assert_eq(c.get("/users/42").body, "user 42")
+    test.assert_eq(c.get("/users/42/").body, "user 42")                 // trailing slash
+    test.assert_eq(c.get("/users/7/posts/9").body, "7/9")
+    test.assert_eq(c.get("/files/a/b/c.txt").body, "file a/b/c.txt")
+    test.assert_eq(c.get("/users/caf%C3%A9").body, "user café")          // decoded
+    r := c.post("/users")
+    test.assert_eq(r.status_code, 201)
+    test.assert_eq(c.get("/nope").status_code, 404)
+    nm := c.request("DELETE", "/users/1")
+    test.assert_eq(nm.status_code, 405)                                   // the path exists, not for DELETE
+    test.assert_eq(nm.get("Allow"), "GET")
+    test.assert_eq(c.request("HEAD", "/").status_code, 200)               // HEAD runs GET routes
+}
+
+define test_query_json_form_and_headers() -> void {
+    app := web.App()
+    app.get("/search", fn(req, res) { res.json({"q": req.query["q"], "page": req.query["page"]}) })
+    app.post("/echo", fn(req, res) {
+        data: Map = req.json()
+        res.json({"got": data["name"], "json": req.is_type("json")})
+    })
+    app.post("/form", fn(req, res) {
+        f := req.form()
+        res.text(f["first"] + " " + f["last"])
+    })
+    app.get("/agent", fn(req, res) { res.text(req.header("User-Agent")) })
+    c := web.TestClient(app)
+    r := c.get("/search?q=hello%20world&page=2")
+    test.assert_eq(r.get("Content-Type"), "application/json")
+    m: Map = json.loads(r.body)
+    test.assert_eq(m["q"], "hello world")
+    test.assert_eq(m["page"], "2")
+    e: Map = json.loads(c.post_json("/echo", {"name": "Ada"}).body)
+    test.assert_eq(e["got"], "Ada")
+    test.assert_eq(e["json"], true)
+    test.assert_eq(c.post_form("/form", {"first": "Ada", "last": "Lovelace & co"}).body, "Ada Lovelace & co")
+    test.assert_eq(c.get("/agent", {"user-agent": "probe/1"}).body, "probe/1")
+    bad := c.request("POST", "/echo", "{not json", {"Content-Type": "application/json"})
+    test.assert_eq(bad.status_code, 400)                                 // req.json() on bad JSON
+}
+
+define test_middleware_order_and_short_circuit() -> void {
+    app := web.App()
+    seen := []
+    app.use(fn(req, res, next) {
+        seen.append("a")
+        next()
+        seen.append("a-after")
+    })
+    app.use(fn(req, res, next) {
+        if req.header("authorization") != "secret" {
+            res.status(401).text("no")
+            return
+        }
+        req.locals["user"] = "ada"
+        next()
+    }, path="/admin")
+    app.get("/admin/home", fn(req, res) { res.text("hi " + req.locals["user"]) })
+    app.get("/open", fn(req, res) {
+        seen.append("route")
+        res.text("open")
+    })
+    c := web.TestClient(app)
+    test.assert_eq(c.get("/open").body, "open")
+    test.assert_eq(seen, ["a", "route", "a-after"])
+    test.assert_eq(c.get("/admin/home").status_code, 401)
+    test.assert_eq(c.get("/admin/home", {"Authorization": "secret"}).body, "hi ada")
+}
+
+define test_errors_and_not_found() -> void {
+    app := web.App()
+    app.get("/missing", fn(req, res) { throw web.HttpError(404, "no such user") })
+    app.get("/boom", fn(req, res) { throw ValueError("kaboom") })
+    app.get("/silent", fn(req, res) { })
+    c := web.TestClient(app)
+    r := c.get("/missing")
+    test.assert_eq(r.status_code, 404)
+    test.assert_eq(r.body, "no such user")
+    test.assert_eq(c.get("/boom").status_code, 500)
+    test.assert_eq(c.get("/boom").body, "Internal Server Error")          // details aren't leaked
+    test.assert_eq(c.get("/silent").status_code, 500)                     // never answered
+    app.on_error(fn(err, req, res) { res.status(503).json({"error": err.message}) })
+    app.on_not_found(fn(req, res) { res.status(404).html("<p>gone</p>") })
+    test.assert_eq(c.get("/boom").status_code, 503)
+    test.assert_eq(c.get("/zzz").body, "<p>gone</p>")
+}
+
+define test_router_mount_and_responses() -> void {
+    api := web.Router()
+    api.get("/items", fn(req, res) { res.json([1, 2, 3]) })
+    api.get("/items/:id", fn(req, res) { res.json({"id": req.params["id"]}) })
+    app := web.App()
+    app.mount("/api", api)
+    app.get("/go", fn(req, res) { res.redirect("/api/items") })
+    app.get("/login", fn(req, res) { res.cookie("session", "abc 123", max_age=3600).text("ok") })
+    app.get("/me", fn(req, res) { res.text("session=" + req.cookie("session")) })
+    app.get("/logout", fn(req, res) { res.clear_cookie("session").text("bye") })
+    app.get("/empty", fn(req, res) { res.end() })
+    c := web.TestClient(app)
+    test.assert_eq(c.get("/api/items").body, "[1,2,3]")
+    test.assert_eq(c.get("/api/items/5").body, "{\"id\":\"5\"}")
+    go := c.get("/go")
+    test.assert_eq(go.status_code, 302)
+    test.assert_eq(go.get("Location"), "/api/items")
+    login := c.get("/login")
+    test.assert_true(login.get("Set-Cookie").contains("session=abc%20123"))
+    test.assert_true(login.get("Set-Cookie").contains("HttpOnly"))
+    test.assert_eq(c.get("/me").body, "session=abc 123")                   // the client keeps cookies
+    c.get("/logout")
+    test.assert_eq(c.get("/me").body, "session=")
+    test.assert_eq(c.get("/empty").status_code, 204)
+}
+
+define test_static_files() -> void {
+    dir := fs.temp_dir()
+    fs.write_text(fs.join(dir, "index.html"), "<h1>home</h1>")
+    fs.write_text(fs.join(dir, "style.css"), "body{}")
+    app := web.App()
+    app.use(web.static(dir))
+    app.get("/api", fn(req, res) { res.text("api") })
+    c := web.TestClient(app)
+    test.assert_eq(c.get("/").body, "<h1>home</h1>")
+    css := c.get("/style.css")
+    test.assert_eq(css.get("Content-Type"), "text/css; charset=utf-8")
+    // A binary file (tests/fixtures/pixel.png has zero bytes): every byte arrives.
+    app.use(web.static("tests/fixtures", prefix="/fx"))
+    png := c.get("/fx/pixel.png")
+    test.assert_eq(png.get("Content-Type"), "image/png")
+    test.assert_eq(web.byte_length(png.body), fs.size("tests/fixtures/pixel.png"))
+    test.assert_eq(c.get("/api").body, "api")                             // not a file: the routes
+    test.assert_eq(c.get("/../etc/passwd").status_code, 404)
+    lm := css.get("Last-Modified")
+    test.assert_true(lm.endswith("GMT"))
+    test.assert_eq(c.get("/style.css", {"If-Modified-Since": lm}).status_code, 304)
+    app2 := web.App()
+    app2.use(web.static(dir, prefix="/assets"))
+    c2 := web.TestClient(app2)
+    test.assert_eq(c2.get("/assets/style.css").body, "body{}")
+    test.assert_eq(c2.get("/style.css").status_code, 404)
+    fs.remove_tree(dir)
+}
+
+define test_templates() -> void {
+    t := web.Template("<h1>{{ title }}</h1>{% if user.admin %}<b>admin</b>{% elif user %}user{% else %}guest{% end %}" +
+                      "<ul>{% for it in items %}<li>{{ loop.index }}:{{ it.name | upper }}</li>{% else %}<li>none</li>{% end %}</ul>" +
+                      "{{ html }}|{{{ html }}}|{{ html | raw }}{# hidden #}|{{ items | length }}|{% if not missing %}no{% end %}" +
+                      "{% if user.name == \"Ada\" %}=Ada{% end %}")
+    page := t.render({"title": "Hi & <you>", "user": {"admin": false, "name": "Ada"},
+                      "items": [{"name": "a"}, {"name": "b"}], "html": "<i>x</i>"})
+    test.assert_eq(page, "<h1>Hi &amp; &lt;you&gt;</h1>user<ul><li>1:A</li><li>2:B</li></ul>" +
+                         "&lt;i&gt;x&lt;/i&gt;|<i>x</i>|<i>x</i>|2|no=Ada")
+    test.assert_eq(t.render({"items": []}).contains("<li>none</li>"), true)
+    test.assert_true(t.render({}).contains("guest"))
+    dir := fs.temp_dir()
+    fs.write_text(fs.join(dir, "header.html"), "<header>{{ title }}</header>")
+    fs.write_text(fs.join(dir, "page.html"), "{% include \"header.html\" %}<main>{{ body }}</main>")
+    app := web.App()
+    app.views = dir
+    app.get("/", fn(req, res) { res.render("page.html", {"title": "T", "body": "B"}) })
+    r := web.TestClient(app).get("/")
+    test.assert_eq(r.body, "<header>T</header><main>B</main>")
+    test.assert_eq(r.get("Content-Type"), "text/html; charset=utf-8")
+    fs.remove_tree(dir)
+}
+
+define test_helpers() -> void {
+    test.assert_eq(web.mime_type("a/b.JS"), "text/javascript; charset=utf-8")
+    test.assert_eq(web.mime_type("x.unknown"), "application/octet-stream")
+    test.assert_eq(web.status_text(404), "Not Found")
+    test.assert_eq(web.escape("<a href=\"x\">'"), "&lt;a href=&quot;x&quot;&gt;&#39;")
+    test.assert_eq(web.byte_length("héllo"), 6)
+    test.assert_eq(web.http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT")
+}
+
+// ---- the real server ----
+
+ready := [false]
+
+async define serve(app: web.App, port: Int) {
+    try {
+        app.listen(port, on_ready=fn() { ready[0] = true }, quiet=true)
+    } catch (e: Exception) {
+        print("serve failed: " + e.message)
+    }
+}
+
+define test_real_server_keep_alive_and_bytes() -> void {
+    app := web.App()
+    app.get("/hello/:name", fn(req, res) { res.text("héllo " + req.params["name"]) })
+    app.post("/len", fn(req, res) { res.text(String(web.byte_length(req.body))) })
+    port := 18000 + (web.now() % 1000)
+    serve(app, port)
+    waited := 0
+    while not ready[0] and waited < 3000 {
+        sys.sleep(10)
+        waited = waited + 10
+    }
+    test.assert_true(ready[0])
+    base := "http://127.0.0.1:" + String(port)
+    r := http.get(base + "/hello/ada")
+    test.assert_eq(r.status_code, 200)
+    test.assert_eq(r.text, "héllo ada")                                  // all bytes: Content-Length counts bytes
+    p := http.post(base + "/len", "12345")
+    test.assert_eq(p.text, "5")
+    // Two requests on one connection (keep-alive), the second POST with a body.
+    with Socket() as s {
+        s.connect("127.0.0.1", port)
+        s.send("GET /hello/one HTTP/1.1\r\nHost: x\r\n\r\nPOST /len HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")
+        got := ""
+        while true {
+            chunk := s.recv(4096)
+            if chunk.length() == 0 { break }
+            got = got + chunk
+        }
+        test.assert_true(got.contains("héllo one"))
+        test.assert_true(got.contains("Connection: keep-alive"))
+        test.assert_true(got.contains("\r\n\r\n3"))
+        test.assert_true(got.contains("Connection: close"))
+    }
+    app.stop()
+}

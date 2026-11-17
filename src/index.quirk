@@ -1,0 +1,1544 @@
+---
+web — build web apps and HTTP APIs, Express-style.
+
+@example
+use web
+
+app := web.App()
+app.use(web.logger())
+app.use(web.static("public"))
+
+app.get("/", fn(req, res) {
+    res.html("<h1>Hello</h1>")
+})
+
+app.get("/users/:id", fn(req, res) {
+    res.json({"id": req.params["id"]})
+})
+
+app.post("/echo", fn(req, res) {
+    res.json(req.json())
+})
+
+app.listen(3000)
+---
+use net.socket
+use encoding.json
+use url
+use fs
+from net.socket use { Socket }
+
+// ===== byte-level helpers (runtime: src/Runtime/libs/web.c) =====
+
+extern define byte_length(s: String) -> Int
+extern define byte_find(hay: String, needle: String, start: Int) -> Int
+extern define byte_slice(s: String, start: Int, length: Int) -> String
+extern define http_date(t: Int) -> String
+extern define now() -> Int
+extern define recv_timeout(fd: Int, size: Int, timeout_ms: Int) -> String
+extern define send_all(fd: Int, data: String) -> Int
+
+// ===== errors =====
+
+---
+Throw from a handler to answer with `status` and `message` — e.g.
+`throw web.HttpError(404, "no such user")`. The app's error handler gets
+it (the default one sends the status and message).
+---
+struct HttpError : Exception {
+    status: Int
+
+    define __init(self, status: Int, message: String) -> void {
+        super().__init(message)
+        self.status = status
+    }
+}
+
+// ===== status texts =====
+
+define status_text(code: Int) -> String {
+    texts := {"100": "Continue", "101": "Switching Protocols", "200": "OK", "201": "Created",
+              "202": "Accepted", "204": "No Content", "206": "Partial Content",
+              "301": "Moved Permanently", "302": "Found", "303": "See Other", "304": "Not Modified",
+              "307": "Temporary Redirect", "308": "Permanent Redirect", "400": "Bad Request",
+              "401": "Unauthorized", "403": "Forbidden", "404": "Not Found",
+              "405": "Method Not Allowed", "406": "Not Acceptable", "408": "Request Timeout",
+              "409": "Conflict", "410": "Gone", "411": "Length Required", "413": "Content Too Large",
+              "415": "Unsupported Media Type", "422": "Unprocessable Content", "429": "Too Many Requests",
+              "431": "Request Header Fields Too Large", "500": "Internal Server Error",
+              "501": "Not Implemented", "502": "Bad Gateway", "503": "Service Unavailable"}
+    key := String(code)
+    if texts.has(key) {
+        t: String = texts[key]
+        return t
+    }
+    return "Status " + key
+}
+
+// ===== content types =====
+
+---
+The Content-Type for a file name's extension ("style.css" → "text/css;
+charset=utf-8"); "application/octet-stream" when unknown.
+---
+define mime_type(path: String) -> String {
+    types := {".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+              ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+              ".mjs": "text/javascript; charset=utf-8", ".json": "application/json",
+              ".map": "application/json", ".txt": "text/plain; charset=utf-8",
+              ".md": "text/markdown; charset=utf-8", ".csv": "text/csv; charset=utf-8",
+              ".xml": "application/xml", ".svg": "image/svg+xml", ".png": "image/png",
+              ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+              ".webp": "image/webp", ".avif": "image/avif", ".ico": "image/x-icon",
+              ".bmp": "image/bmp", ".woff": "font/woff", ".woff2": "font/woff2",
+              ".ttf": "font/ttf", ".otf": "font/otf", ".pdf": "application/pdf",
+              ".wasm": "application/wasm", ".zip": "application/zip", ".gz": "application/gzip",
+              ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+              ".mp4": "video/mp4", ".webm": "video/webm"}
+    ext := fs.extname(path).lower()
+    if types.has(ext) {
+        t: String = types[ext]
+        return t
+    }
+    return "application/octet-stream"
+}
+
+// ===== Request =====
+
+---
+An incoming request, as a handler sees it:
+  `method`  — "GET", "POST", ... (upper case)
+  `path`    — "/users/42" (decoded, without the query)
+  `url`     — the request target as sent ("/users/42?tab=1")
+  `query`   — Map of the query string ("?tab=1" → {"tab": "1"})
+  `params`  — Map of the route's `:name` / `*name` parts
+  `headers` — Map of headers, names in lower case
+  `body`    — the raw body (bytes kept as they came)
+  `locals`  — a Map for middleware to pass things to handlers
+`json()`, `form()`, `cookies()`, `header(name)` read the rest.
+---
+struct Request {
+    method: String
+    path: String
+    url: String
+    version: String
+    query: Map
+    params: Map
+    headers: Map
+    body: String
+    locals: Map
+    ip: String
+    _cookies: Map
+
+    define __init(self, method: String, target: String, headers: Map = {}, body: String = "") -> void {
+        self.method = method.upper()
+        self.url = target
+        self.version = "HTTP/1.1"
+        q := target.find("?")
+        raw_path := target
+        self.query = {}
+        if q >= 0 {
+            raw_path = target.substring(0, q)
+            self.query = url.parse_query(target.substring(q + 1, target.length()))
+        }
+        self.path = url.unquote(raw_path)
+        if self.path == "" { self.path = "/" }
+        self.params = {}
+        self.headers = {}
+        for k in headers.keys() {
+            key: String = k
+            v: String = headers[key]
+            self.headers[key.lower()] = v
+        }
+        self.body = body
+        self.locals = {}
+        self.ip = ""
+        self._cookies = null
+    }
+
+    --- A header's value ("" if absent); the name is case-insensitive. ---
+    define header(self, name: String) -> String {
+        key := name.lower()
+        if self.headers.has(key) {
+            v: String = self.headers[key]
+            return v
+        }
+        return ""
+    }
+
+    --- True if the request's Content-Type is `kind` ("json", "form", or a full type like "text/plain"). ---
+    define is_type(self, kind: String) -> Bool {
+        ct := self.header("content-type").lower()
+        if kind == "json" { return ct.contains("json") }
+        if kind == "form" { return ct.contains("application/x-www-form-urlencoded") }
+        return ct.startswith(kind.lower())
+    }
+
+    ---
+    The body parsed as JSON (a Map, List, String, number...).
+    @throws HttpError 400 if it isn't valid JSON.
+    ---
+    define json(self) -> Any {
+        if self.body.trim() == "" { return null }
+        try {
+            return json.loads(self.body)
+        } catch (e: Exception) {
+            throw HttpError(400, "invalid JSON body: " + e.message)
+        }
+        return null
+    }
+
+    --- The body parsed as a form (`a=1&b=two`, as an HTML form posts it): a Map of Strings. ---
+    define form(self) -> Map {
+        return url.parse_query(self.body)
+    }
+
+    --- The request's cookies: a Map of name → value. ---
+    define cookies(self) -> Map {
+        if self._cookies != null { return self._cookies }
+        out := {}
+        raw := self.header("cookie")
+        if raw != "" {
+            for part in raw.split(";") {
+                p: String = part
+                eq := p.find("=")
+                if eq > 0 {
+                    k := p.substring(0, eq).trim()
+                    v := p.substring(eq + 1, p.length()).trim()
+                    if v.startswith("\"") and v.endswith("\"") and v.length() >= 2 { v = v.substring(1, v.length() - 1) }
+                    out[k] = url.unquote(v)
+                }
+            }
+        }
+        self._cookies = out
+        return out
+    }
+
+    --- One cookie's value, or "" when the request doesn't have it. ---
+    define cookie(self, name: String) -> String {
+        c := self.cookies()
+        if c.has(name) {
+            v: String = c[name]
+            return v
+        }
+        return ""
+    }
+
+    --- True if the client accepts `kind` ("json", "html", or a full type) — from the Accept header. ---
+    define accepts(self, kind: String) -> Bool {
+        acc := self.header("accept").lower()
+        if acc == "" or acc.contains("*/*") { return true }
+        if kind == "json" { return acc.contains("json") }
+        if kind == "html" { return acc.contains("text/html") }
+        return acc.contains(kind.lower())
+    }
+
+    define __str(self) -> String {
+        return "Request(" + self.method + " " + self.url + ")"
+    }
+}
+
+// ===== Response =====
+
+---
+The answer a handler builds: `res.status(201).json(value)`,
+`res.html(page)`, `res.redirect("/login")`, `res.file("report.pdf")`,
+`res.set("X-Name", "v")`, `res.cookie("session", id)`. The first send
+wins; it's written when the handler (and middleware) return.
+---
+struct Response {
+    status_code: Int
+    body: String
+    sent: Bool
+    keep_alive: Bool
+    _headers: List
+    _req: Request
+    _app: App
+
+    define __init(self, req: Request = null) -> void {
+        self.status_code = 200
+        self.body = ""
+        self.sent = false
+        self.keep_alive = true
+        self._headers = []
+        self._req = req
+        self._app = null
+    }
+
+    --- Set the status code (chainable: `res.status(404).text("nope")`). ---
+    define status(self, code: Int) -> Response {
+        self.status_code = code
+        return self
+    }
+
+    --- Set a header, replacing one of the same name (chainable). ---
+    define set(self, name: String, value: String) -> Response {
+        self.unset(name)
+        self._headers.append([name, value])
+        return self
+    }
+
+    --- Add a header, keeping others of the same name (Set-Cookie). ---
+    define append_header(self, name: String, value: String) -> Response {
+        self._headers.append([name, value])
+        return self
+    }
+
+    --- Remove a header. ---
+    define unset(self, name: String) -> void {
+        low := name.lower()
+        kept := []
+        for h in self._headers {
+            pair: List = h
+            hn: String = pair[0]
+            if hn.lower() != low { kept.append(pair) }
+        }
+        self._headers = kept
+    }
+
+    --- A header's value as set so far ("" if none). ---
+    define get(self, name: String) -> String {
+        low := name.lower()
+        for h in self._headers {
+            pair: List = h
+            hn: String = pair[0]
+            if hn.lower() == low {
+                hv: String = pair[1]
+                return hv
+            }
+        }
+        return ""
+    }
+
+    --- Set the Content-Type (chainable): "json", "html", "text", or a full type. ---
+    define content_type(self, kind: String) -> Response {
+        t := kind
+        if kind == "json" { t = "application/json" }
+        elif kind == "html" { t = "text/html; charset=utf-8" }
+        elif kind == "text" { t = "text/plain; charset=utf-8" }
+        elif not kind.contains("/") { t = mime_type("x." + kind) }
+        return self.set("Content-Type", t)
+    }
+
+    ---
+    Send `body` as the response — text/html unless a Content-Type is
+    set. Later sends are ignored (the first one wins).
+    ---
+    define send(self, body: String) -> Response {
+        if self.sent { return self }
+        if self.get("Content-Type") == "" { self.set("Content-Type", "text/html; charset=utf-8") }
+        self.body = body
+        self.sent = true
+        return self
+    }
+
+    --- Send plain text. ---
+    define text(self, body: String) -> Response {
+        if self.get("Content-Type") == "" { self.set("Content-Type", "text/plain; charset=utf-8") }
+        return self.send(body)
+    }
+
+    --- Send HTML: a String, or an `html` Element (rendered). ---
+    define html(self, page: Any) -> Response {
+        self.set("Content-Type", "text/html; charset=utf-8")
+        if page != null and type(page) == "Element" {
+            return self.send(page.render())
+        }
+        return self.send(String(page))
+    }
+
+    --- Send `value` (Map, List, String, number...) as JSON. ---
+    define json(self, value: Any) -> Response {
+        self.set("Content-Type", "application/json")
+        return self.send(json.dumps(value))
+    }
+
+    --- Answer with just a status code and its text ("Not Found"). ---
+    define send_status(self, code: Int) -> Response {
+        self.status_code = code
+        return self.text(status_text(code))
+    }
+
+    --- Redirect to `location` (302 Found, or `code`: 301, 303, 307, 308). ---
+    define redirect(self, location: String, code: Int = 302) -> Response {
+        self.status_code = code
+        self.set("Location", location)
+        return self.text(status_text(code) + ". Redirecting to " + location)
+    }
+
+    ---
+    Set a cookie. `max_age` in seconds (-1: until the browser closes);
+    `http_only` hides it from JavaScript; `same_site` is "Lax", "Strict"
+    or "None" (then `secure` too).
+    ---
+    define cookie(self, name: String, value: String, max_age: Int = -1, path: String = "/", http_only: Bool = true, secure: Bool = false, same_site: String = "Lax", domain: String = "") -> Response {
+        c := name + "=" + url.quote(value) + "; Path=" + path
+        if max_age >= 0 { c = c + "; Max-Age=" + String(max_age) + "; Expires=" + http_date(now() + max_age) }
+        if domain != "" { c = c + "; Domain=" + domain }
+        if http_only { c = c + "; HttpOnly" }
+        if secure { c = c + "; Secure" }
+        if same_site != "" { c = c + "; SameSite=" + same_site }
+        return self.append_header("Set-Cookie", c)
+    }
+
+    --- Delete a cookie in the browser. ---
+    define clear_cookie(self, name: String, path: String = "/") -> Response {
+        return self.append_header("Set-Cookie", name + "=; Path=" + path + "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+    }
+
+    ---
+    Send a file, with its Content-Type and Last-Modified — or 304 Not
+    Modified when the browser's copy is current, 404 when there's no such
+    file. `download=true` makes the browser save it (as `name`, default
+    the file's own name).
+    ---
+    define file(self, path: String, download: Bool = false, name: String = "") -> Response {
+        if not fs.is_file(path) {
+            self.status_code = 404
+            return self.text("Not Found")
+        }
+        modified := http_date(fs.mtime(path))
+        self.set("Last-Modified", modified)
+        if self._req != null and self._req.header("if-modified-since") == modified {
+            self.status_code = 304
+            self.sent = true
+            self.body = ""
+            return self
+        }
+        self.set("Content-Type", mime_type(path))
+        if download {
+            shown := name != "" ? name : fs.basename(path)
+            self.set("Content-Disposition", "attachment; filename=\"" + shown.replace("\"", "") + "\"")
+        }
+        return self.send(fs.read_text(path))
+    }
+
+    ---
+    Render the template `name` (a file in the app's views folder, see
+    `App.views`) with `data`, and send it as HTML.
+    ---
+    define render(self, name: String, data: Map = {}) -> Response {
+        dir := self._app != null ? self._app.views : "views"
+        page := render_file(fs.join(dir, name), data)
+        return self.html(page)
+    }
+
+    --- End the response with no body (204 if nothing else was set). ---
+    define end(self) -> Response {
+        if self.status_code == 200 and not self.sent { self.status_code = 204 }
+        self.sent = true
+        return self
+    }
+
+    // The response as bytes on the wire.
+    define _wire(self, head_only: Bool) -> String {
+        out := "HTTP/1.1 " + String(self.status_code) + " " + status_text(self.status_code) + "\r\n"
+        has_date := false
+        for h in self._headers {
+            pair: List = h
+            hn: String = pair[0]
+            hv: String = pair[1]
+            if hn.lower() == "content-length" or hn.lower() == "connection" { continue }
+            if hn.lower() == "date" { has_date = true }
+            out = out + hn + ": " + hv.replace("\r", "").replace("\n", "") + "\r\n"
+        }
+        if not has_date { out = out + "Date: " + http_date(now()) + "\r\n" }
+        no_body := self.status_code == 204 or self.status_code == 304 or (self.status_code >= 100 and self.status_code < 200)
+        if not no_body { out = out + "Content-Length: " + String(byte_length(self.body)) + "\r\n" }
+        out = out + "Connection: " + (self.keep_alive ? "keep-alive" : "close") + "\r\n\r\n"
+        if not head_only and not no_body { out = out + self.body }
+        return out
+    }
+
+    define __str(self) -> String {
+        return "Response(" + String(self.status_code) + ")"
+    }
+}
+
+// ===== routing =====
+
+// One route: a method ("" = any), its pattern split into parts, and the
+// handler fn(req, res).
+struct Route {
+    method: String
+    pattern: String
+    parts: List
+    handler: Callable
+
+    define __init(self, method: String, pattern: String, handler: Callable) -> void {
+        self.method = method
+        self.pattern = pattern
+        self.parts = _split_path(pattern)
+        self.handler = handler
+    }
+
+    // The route's params if `path` matches it, else null.
+    define match_path(self, path: String) -> Map {
+        segs := _split_path(path)
+        params := {}
+        i := 0
+        while i < self.parts.length() {
+            part: String = self.parts[i]
+            if part.startswith("*") {
+                rest := ""
+                j := i
+                while j < segs.length() {
+                    sj: String = segs[j]
+                    rest = rest == "" ? sj : rest + "/" + sj
+                    j = j + 1
+                }
+                name := part.substring(1, part.length())
+                params[name == "" ? "wildcard" : name] = rest
+                return params
+            }
+            if i >= segs.length() { return null }
+            seg: String = segs[i]
+            if part.startswith(":") {
+                params[part.substring(1, part.length())] = seg
+            } elif part != seg {
+                return null
+            }
+            i = i + 1
+        }
+        if i != segs.length() { return null }
+        return params
+    }
+}
+
+// "/users/:id/" → ["users", ":id"]
+define _split_path(p: String) -> List {
+    out := []
+    for s in p.split("/") {
+        seg: String = s
+        if seg != "" { out.append(seg) }
+    }
+    return out
+}
+
+// A path inside a prefix ("/api" + "/users" → "/api/users").
+define _join_path(prefix: String, p: String) -> String {
+    a := prefix
+    if a.endswith("/") { a = a.substring(0, a.length() - 1) }
+    b := p
+    if not b.startswith("/") { b = "/" + b }
+    if b == "/" and a != "" { return a }
+    return a + b
+}
+
+// Does `path` sit under `prefix` ("/api" covers "/api" and "/api/x")?
+define _under(path: String, prefix: String) -> Bool {
+    if prefix == "" or prefix == "/" { return true }
+    p := prefix
+    if p.endswith("/") { p = p.substring(0, p.length() - 1) }
+    return path == p or path.startswith(p + "/")
+}
+
+---
+A group of routes and middleware to mount in an app under a prefix:
+
+    api := web.Router()
+    api.get("/users", list_users)
+    app.mount("/api", api)          // GET /api/users
+---
+struct Router {
+    routes: List
+    middleware: List
+
+    define __init(self) -> void {
+        self.routes = []
+        self.middleware = []
+    }
+
+    --- Handle `method` requests to `pattern` ("/users/:id", "/files/*path"). ---
+    define route(self, method: String, pattern: String, handler: Callable) -> Router {
+        self.routes.append(Route(method.upper(), pattern, handler))
+        return self
+    }
+
+    define get(self, pattern: String, handler: Callable) -> Router { return self.route("GET", pattern, handler) }
+    define post(self, pattern: String, handler: Callable) -> Router { return self.route("POST", pattern, handler) }
+    define put(self, pattern: String, handler: Callable) -> Router { return self.route("PUT", pattern, handler) }
+    define patch(self, pattern: String, handler: Callable) -> Router { return self.route("PATCH", pattern, handler) }
+    define delete(self, pattern: String, handler: Callable) -> Router { return self.route("DELETE", pattern, handler) }
+    define options(self, pattern: String, handler: Callable) -> Router { return self.route("OPTIONS", pattern, handler) }
+    --- Any method. ---
+    define all(self, pattern: String, handler: Callable) -> Router { return self.route("", pattern, handler) }
+
+    ---
+    Run middleware `mw(req, res, next)` before the routes — for every
+    request, or only under `path` ("/admin"). Call `next()` to go on; don't
+    to answer here (e.g. a login check).
+    ---
+    define use(self, mw: Callable, path: String = "/") -> Router {
+        self.middleware.append([path, mw])
+        return self
+    }
+}
+
+// Runs middleware one after another; `next()` moves on.
+struct _Chain {
+    app: App
+    req: Request
+    res: Response
+    i: Int
+
+    define __init(self, app: App, req: Request, res: Response) -> void {
+        self.app = app
+        self.req = req
+        self.res = res
+        self.i = 0
+    }
+
+    define step(self) -> void {
+        mws := self.app._router.middleware
+        while self.i < mws.length() {
+            entry: List = mws[self.i]
+            self.i = self.i + 1
+            prefix: String = entry[0]
+            if not _under(self.req.path, prefix) { continue }
+            mw: Callable = entry[1]
+            chain := self
+            mw(self.req, self.res, fn() { chain.step() })
+            return
+        }
+        self.app._route(self.req, self.res)
+    }
+}
+
+// ===== App =====
+
+---
+A web app: routes, middleware, error handling, and a server.
+
+    app := web.App()
+    app.get("/", fn(req, res) { res.text("hi") })
+    app.listen(3000)
+
+Routes run in the order added; the first whose method and path match
+answers. `views` is the templates folder for `res.render`.
+---
+struct App {
+    views: String
+    max_body: Int
+    timeout_ms: Int
+    _router: Router
+    _on_error: Callable
+    _on_not_found: Callable
+    _running: Bool
+    _port: Int
+    _host: String
+
+    define __init(self) -> void {
+        self.views = "views"
+        self.max_body = 10 * 1024 * 1024
+        self.timeout_ms = 15000
+        self._router = Router()
+        self._on_error = null
+        self._on_not_found = null
+        self._running = false
+        self._port = 0
+        self._host = ""
+    }
+
+    --- Handle `method` requests to `pattern` ("/users/:id", "/files/*path"); `handler(req, res)`. ---
+    define route(self, method: String, pattern: String, handler: Callable) -> App {
+        self._router.route(method, pattern, handler)
+        return self
+    }
+
+    define get(self, pattern: String, handler: Callable) -> App { return self.route("GET", pattern, handler) }
+    define post(self, pattern: String, handler: Callable) -> App { return self.route("POST", pattern, handler) }
+    define put(self, pattern: String, handler: Callable) -> App { return self.route("PUT", pattern, handler) }
+    define patch(self, pattern: String, handler: Callable) -> App { return self.route("PATCH", pattern, handler) }
+    define delete(self, pattern: String, handler: Callable) -> App { return self.route("DELETE", pattern, handler) }
+    define options(self, pattern: String, handler: Callable) -> App { return self.route("OPTIONS", pattern, handler) }
+    --- Any method. ---
+    define all(self, pattern: String, handler: Callable) -> App { return self.route("", pattern, handler) }
+
+    ---
+    Run middleware `mw(req, res, next)` before the routes — for every
+    request, or only under `path`. Call `next()` to continue.
+    ---
+    define use(self, mw: Callable, path: String = "/") -> App {
+        self._router.use(mw, path)
+        return self
+    }
+
+    --- Add a Router's routes and middleware under `prefix` ("/api"). ---
+    define mount(self, prefix: String, router: Router) -> App {
+        for m in router.middleware {
+            entry: List = m
+            p: String = entry[0]
+            self._router.middleware.append([_join_path(prefix, p), entry[1]])
+        }
+        for r in router.routes {
+            rt: Route = r
+            self._router.routes.append(Route(rt.method, _join_path(prefix, rt.pattern), rt.handler))
+        }
+        return self
+    }
+
+    ---
+    Handle errors thrown by handlers: `handler(err, req, res)`. By default
+    an HttpError answers with its status and message, anything else with
+    500 (and the error printed).
+    ---
+    define on_error(self, handler: Callable) -> App {
+        self._on_error = handler
+        return self
+    }
+
+    --- Answer requests no route matched: `handler(req, res)` (default: 404 Not Found). ---
+    define on_not_found(self, handler: Callable) -> App {
+        self._on_not_found = handler
+        return self
+    }
+
+    ---
+    Answer `req` into `res` — middleware, the matching route, error and
+    not-found handling — without a network. `listen` uses it for every
+    request; tests can call it directly (see `TestClient`).
+    ---
+    define handle(self, req: Request, res: Response) -> void {
+        res._req = req
+        res._app = self
+        try {
+            _Chain(self, req, res).step()
+        } catch (e: HttpError) {
+            self._fail(e, e.status, req, res)
+        } catch (e: Exception) {
+            self._fail(e, 500, req, res)
+        }
+        if not res.sent {
+            // A handler (or middleware) that returned without answering.
+            res.status_code = res.status_code == 200 ? 500 : res.status_code
+            res.text(status_text(res.status_code))
+        }
+    }
+
+    define _fail(self, e: Exception, status: Int, req: Request, res: Response) -> void {
+        if self._on_error != null {
+            try {
+                self._on_error(e, req, res)
+                if res.sent { return }
+            } catch (e2: Exception) {
+                print("web: error handler failed: " + e2.message)
+            }
+        }
+        res.sent = false
+        res.body = ""
+        allow := res.get("Allow")
+        res._headers = []
+        if status == 405 and allow != "" { res.set("Allow", allow) }
+        res.status_code = status
+        if status >= 500 {
+            print("web: " + req.method + " " + req.url + " failed: " + e.message)
+            res.text(status_text(status))
+        } else {
+            res.text(e.message != "" ? e.message : status_text(status))
+        }
+    }
+
+    define _route(self, req: Request, res: Response) -> void {
+        allowed := []
+        for r in self._router.routes {
+            rt: Route = r
+            params := rt.match_path(req.path)
+            if params == null { continue }
+            method_ok := rt.method == "" or rt.method == req.method or (req.method == "HEAD" and rt.method == "GET")
+            if not method_ok {
+                allowed.append(rt.method)
+                continue
+            }
+            req.params = params
+            rt.handler(req, res)
+            return
+        }
+        if allowed.length() > 0 {
+            res.set("Allow", ", ".join(allowed))
+            throw HttpError(405, "Method Not Allowed")
+        }
+        if self._on_not_found != null {
+            self._on_not_found(req, res)
+            return
+        }
+        res.status(404).text("Not Found")
+    }
+
+    ---
+    Serve the app on `port` (and `host`: "127.0.0.1" only this machine,
+    "0.0.0.0" every interface) until `stop()`. Each connection is handled
+    in its own task, with keep-alive. `on_ready()` runs once listening.
+    ---
+    define listen(self, port: Int = 3000, host: String = "127.0.0.1", on_ready: Callable = null, quiet: Bool = false) -> void {
+        with Socket() as listener {
+            listener.bind(host, port)
+            listener.listen(128)
+            self._running = true
+            self._port = port
+            self._host = host
+            if not quiet { print("web: listening on http://" + (host == "0.0.0.0" ? "localhost" : host) + ":" + String(port)) }
+            if on_ready != null { on_ready() }
+            while self._running {
+                conn := listener.accept()
+                if not self._running {
+                    conn.close()
+                    break
+                }
+                _serve_connection(conn, self)
+            }
+        }
+    }
+
+    --- Stop `listen` (it returns after the current accept). ---
+    define stop(self) -> void {
+        if not self._running { return }
+        self._running = false
+        // Wake the accept loop.
+        try {
+            with Socket() as s {
+                s.connect(self._host == "0.0.0.0" ? "127.0.0.1" : self._host, self._port)
+            }
+        } catch (Exception) {
+        }
+    }
+}
+
+// ===== the server: one task per connection, keep-alive =====
+
+// Read one request's head (up to the blank line) from `buf` + the socket.
+// Returns [head, rest-of-bytes] or [] when the peer went away.
+define _read_head(fd: Int, buf: String, timeout_ms: Int) -> List {
+    data := buf
+    while true {
+        end := byte_find(data, "\r\n\r\n", 0)
+        if end >= 0 {
+            return [byte_slice(data, 0, end), byte_slice(data, end + 4, -1)]
+        }
+        if byte_length(data) > 65536 { return ["", "too large"] }
+        chunk := recv_timeout(fd, 65536, timeout_ms)
+        if byte_length(chunk) == 0 { return [] }
+        data = data + chunk
+    }
+    return []
+}
+
+// Request bodies sent with Transfer-Encoding: chunked.
+// Returns [body, rest] or [] when the peer went away / it's malformed.
+define _read_chunked(fd: Int, buf: String, timeout_ms: Int, limit: Int) -> List {
+    data := buf
+    body := ""
+    while true {
+        line_end := byte_find(data, "\r\n", 0)
+        while line_end < 0 {
+            chunk := recv_timeout(fd, 65536, timeout_ms)
+            if byte_length(chunk) == 0 { return [] }
+            data = data + chunk
+            line_end = byte_find(data, "\r\n", 0)
+        }
+        size_hex := byte_slice(data, 0, line_end)
+        semi := size_hex.find(";")
+        if semi >= 0 { size_hex = size_hex.substring(0, semi) }
+        size := _hex(size_hex.trim())
+        if size < 0 { return [] }
+        data = byte_slice(data, line_end + 2, -1)
+        if size == 0 {
+            // trailers until a blank line
+            done := byte_find(data, "\r\n", 0)
+            while done < 0 {
+                chunk := recv_timeout(fd, 65536, timeout_ms)
+                if byte_length(chunk) == 0 { return [] }
+                data = data + chunk
+                done = byte_find(data, "\r\n", 0)
+            }
+            return [body, byte_slice(data, done + 2, -1)]
+        }
+        while byte_length(data) < size + 2 {
+            chunk := recv_timeout(fd, 65536, timeout_ms)
+            if byte_length(chunk) == 0 { return [] }
+            data = data + chunk
+        }
+        body = body + byte_slice(data, 0, size)
+        if byte_length(body) > limit { return ["", "too large"] }
+        data = byte_slice(data, size + 2, -1)
+    }
+    return []
+}
+
+define _hex(s: String) -> Int {
+    if s == "" { return -1 }
+    digits := "0123456789abcdef"
+    n := 0
+    for ch in s.lower() {
+        c: String = ch
+        d := digits.find(c)
+        if d < 0 { return -1 }
+        n = n * 16 + d
+    }
+    return n
+}
+
+define _send_error(fd: Int, code: Int) -> void {
+    r := Response()
+    r.keep_alive = false
+    r.status_code = code
+    r.text(status_text(code))
+    send_all(fd, r._wire(false))
+}
+
+async define _serve_connection(conn: Socket, app: App) {
+    with conn as c {
+        fd := c._fd
+        buf := ""
+        keep := true
+        while keep and app._running {
+            got := _read_head(fd, buf, app.timeout_ms)
+            if got.length() == 0 { return }
+            head: String = got[0]
+            rest: String = got[1]
+            if head == "" {
+                _send_error(fd, 431)
+                return
+            }
+            lines := head.split("\r\n")
+            first: String = lines[0]
+            parts := first.split(" ")
+            if parts.length() != 3 {
+                _send_error(fd, 400)
+                return
+            }
+            method: String = parts[0]
+            target: String = parts[1]
+            version: String = parts[2]
+            headers := {}
+            i := 1
+            while i < lines.length() {
+                line: String = lines[i]
+                colon := line.find(":")
+                if colon > 0 {
+                    name := line.substring(0, colon).trim().lower()
+                    value := line.substring(colon + 1, line.length()).trim()
+                    if headers.has(name) {
+                        prev: String = headers[name]
+                        headers[name] = prev + ", " + value
+                    } else {
+                        headers[name] = value
+                    }
+                }
+                i = i + 1
+            }
+            req := Request(method, target, headers)
+            req.version = version
+            // The body: Content-Length bytes, or chunked.
+            te := req.header("transfer-encoding").lower()
+            if te.contains("chunked") {
+                body_got := _read_chunked(fd, rest, app.timeout_ms, app.max_body)
+                if body_got.length() == 0 { return }
+                b0: String = body_got[0]
+                b1: String = body_got[1]
+                if b0 == "" and b1 == "too large" {
+                    _send_error(fd, 413)
+                    return
+                }
+                req.body = b0
+                buf = b1
+            } else {
+                cl := req.header("content-length")
+                n := 0
+                if cl != "" {
+                    n = _hex_or_dec(cl)
+                    if n < 0 {
+                        _send_error(fd, 400)
+                        return
+                    }
+                }
+                if n > app.max_body {
+                    _send_error(fd, 413)
+                    return
+                }
+                data := rest
+                while byte_length(data) < n {
+                    chunk := recv_timeout(fd, 65536, app.timeout_ms)
+                    if byte_length(chunk) == 0 { return }
+                    data = data + chunk
+                }
+                req.body = byte_slice(data, 0, n)
+                buf = byte_slice(data, n, -1)
+            }
+            conn_hdr := req.header("connection").lower()
+            if version == "HTTP/1.0" {
+                keep = conn_hdr.contains("keep-alive")
+            } else {
+                keep = not conn_hdr.contains("close")
+            }
+            res := Response(req)
+            res.keep_alive = keep
+            app.handle(req, res)
+            if not res.keep_alive { keep = false }
+            if send_all(fd, res._wire(req.method == "HEAD")) < 0 { return }
+        }
+    }
+}
+
+// A decimal Content-Length, or -1.
+define _hex_or_dec(s: String) -> Int {
+    t := s.trim()
+    if t == "" { return -1 }
+    for ch in t {
+        c: String = ch
+        if "0123456789".find(c) < 0 { return -1 }
+    }
+    return Int(t)
+}
+
+// ===== middleware =====
+
+---
+Middleware that serves files under the folder `dir` — GET / HEAD of
+"/style.css" sends "dir/style.css", "/" and folders their index.html.
+Requests for other paths (or methods) go on to the routes. `prefix`
+serves them under a URL path instead ("/assets").
+---
+define static(dir: String, prefix: String = "/") -> Callable {
+    return fn(req, res, next) {
+        r: Request = req
+        rs: Response = res
+        nx: Callable = next
+        if (r.method != "GET" and r.method != "HEAD") or not _under(r.path, prefix) {
+            nx()
+            return
+        }
+        rel := r.path
+        p := prefix
+        if p.endswith("/") { p = p.substring(0, p.length() - 1) }
+        if p != "" { rel = rel.substring(p.length(), rel.length()) }
+        // No way out of `dir`: ".." and absolute parts are refused.
+        safe := true
+        for s in rel.split("/") {
+            seg: String = s
+            if seg == ".." or seg.contains("\\") or seg.contains(":") { safe = false }
+        }
+        if not safe {
+            nx()
+            return
+        }
+        full := fs.join(dir, rel.startswith("/") ? rel.substring(1, rel.length()) : rel)
+        if fs.is_dir(full) { full = fs.join(full, "index.html") }
+        if fs.is_file(full) {
+            rs.file(full)
+            return
+        }
+        nx()
+    }
+}
+
+---
+Middleware that prints one line per request: method, path, status and
+time taken ("GET /users 200 3ms").
+---
+define logger() -> Callable {
+    return fn(req, res, next) {
+        r: Request = req
+        rs: Response = res
+        nx: Callable = next
+        started := _ms()
+        nx()
+        print(r.method + " " + r.url + " " + String(rs.status_code) + " " + String(_ms() - started) + "ms")
+    }
+}
+
+---
+Middleware that lets pages on other sites call this API from browsers
+(CORS): `origin` "*" (any) or one site ("https://example.com").
+Answers preflight OPTIONS requests itself.
+---
+define cors(origin: String = "*", methods: String = "GET, POST, PUT, PATCH, DELETE, OPTIONS", headers: String = "Content-Type, Authorization") -> Callable {
+    return fn(req, res, next) {
+        r: Request = req
+        rs: Response = res
+        nx: Callable = next
+        rs.set("Access-Control-Allow-Origin", origin)
+        if origin != "*" { rs.set("Vary", "Origin") }
+        if r.method == "OPTIONS" and r.header("access-control-request-method") != "" {
+            rs.set("Access-Control-Allow-Methods", methods)
+            rs.set("Access-Control-Allow-Headers", headers)
+            rs.set("Access-Control-Max-Age", "86400")
+            rs.status(204).end()
+            return
+        }
+        nx()
+    }
+}
+
+extern define ms() -> Int
+
+define _ms() -> Int {
+    return ms()
+}
+
+// ===== templates =====
+
+---
+A page template — HTML with places for data:
+
+    {{ user.name }}           a value, HTML-escaped (dotted: Map keys, List indexes)
+    {{ bio | raw }}           not escaped; also `| upper`, `| lower`, `| length`, `| json`
+    {% if user.admin %} … {% elif guest %} … {% else %} … {% end %}
+    {% if not items %} … {% end %}       also `==` / `!=` with "text" or numbers
+    {% for item in items %} {{ loop.index }}. {{ item }} {% else %} none {% end %}
+    {% include "header.html" %}          another file (from the same folder)
+    {# a comment #}
+
+`Template(text).render(data)` gives the page; `render_file(path, data)`
+reads (and caches) a file.
+---
+struct Template {
+    nodes: List
+    dir: String
+
+    define __init(self, source: String, dir: String = ".") -> void {
+        self.dir = dir
+        toks := _tpl_tokens(source)
+        pos := [0]
+        self.nodes = _tpl_parse(toks, pos, [])
+    }
+
+    --- The page for `data` (a Map of names to values). ---
+    define render(self, data: Map = {}) -> String {
+        return _tpl_render(self.nodes, [data], self.dir)
+    }
+}
+
+// Template caching by path (re-read when the file changes).
+_tpl_cache := {}
+
+--- Render the template file at `path` with `data` (see `Template`). ---
+define render_file(path: String, data: Map = {}) -> String {
+    if not fs.is_file(path) { throw HttpError(500, "template not found: " + path) }
+    stamp := String(fs.mtime(path)) + ":" + String(fs.size(path))
+    if _tpl_cache.has(path) {
+        entry: List = _tpl_cache[path]
+        s: String = entry[0]
+        if s == stamp {
+            t: Template = entry[1]
+            return t.render(data)
+        }
+    }
+    slash := path.replace("\\", "/")
+    cut := -1
+    i := 0
+    while i < slash.length() {
+        if slash.substring(i, i + 1) == "/" { cut = i }
+        i = i + 1
+    }
+    dir := cut >= 0 ? path.substring(0, cut) : "."
+    t := Template(fs.read_text(path), dir)
+    _tpl_cache[path] = [stamp, t]
+    return t.render(data)
+}
+
+--- `s` with HTML's special characters escaped (& < > " '). ---
+define escape(s: String) -> String {
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&#39;")
+}
+
+// Tokens: ["text", s], ["var", expr], ["tag", body].
+define _tpl_tokens(src: String) -> List {
+    out := []
+    i := 0
+    n := src.length()
+    text := ""
+    while i < n {
+        two := src.substring(i, _min_int(i + 2, n))
+        if two == "{{" or two == "{%" or two == "{#" {
+            close := two == "{{" ? "}}" : (two == "{%" ? "%}" : "#}")
+            found := src.substring(i + 2, n).find(close)
+            end := found < 0 ? -1 : found + i + 2
+            if end < 0 {
+                text = text + src.substring(i, n)
+                break
+            }
+            if text != "" {
+                out.append(["text", text])
+                text = ""
+            }
+            inner := src.substring(i + 2, end).trim()
+            if two == "{{" {
+                // {{{ raw }}}
+                if inner.startswith("{") and src.substring(end, _min_int(end + 3, n)) == "}}}" {
+                    out.append(["var", inner.substring(1, inner.length()).trim() + " | raw"])
+                    end = end + 1
+                } else {
+                    out.append(["var", inner])
+                }
+            } elif two == "{%" {
+                out.append(["tag", inner])
+            }
+            i = end + 2
+        } else {
+            text = text + src.substring(i, i + 1)
+            i = i + 1
+        }
+    }
+    if text != "" { out.append(["text", text]) }
+    return out
+}
+
+define _min_int(a: Int, b: Int) -> Int {
+    return a < b ? a : b
+}
+
+// Nodes: ["text", s] / ["var", expr] / ["if", [[cond, body], ...], else_body]
+// / ["for", var, expr, body, else_body] / ["include", file]. Stops at a
+// tag in `stop` ("end", "else", "elif ...") and leaves pos on it.
+define _tpl_parse(toks: List, pos: List, stop: List) -> List {
+    nodes := []
+    while true {
+        p: Int = pos[0]
+        if p >= toks.length() { return nodes }
+        tk: List = toks[p]
+        kind: String = tk[0]
+        val: String = tk[1]
+        if kind != "tag" {
+            nodes.append(tk)
+            pos[0] = p + 1
+            continue
+        }
+        word := val.split(" ")[0]
+        w: String = word
+        for s in stop {
+            st: String = s
+            if w == st { return nodes }
+        }
+        pos[0] = p + 1
+        if w == "if" {
+            branches := []
+            cond := val.substring(2, val.length()).trim()
+            else_body := []
+            while true {
+                body := _tpl_parse(toks, pos, ["elif", "else", "end", "endif"])
+                branches.append([cond, body])
+                q: Int = pos[0]
+                if q >= toks.length() { break }
+                t2: List = toks[q]
+                v2: String = t2[1]
+                pos[0] = q + 1
+                if v2.startswith("elif") {
+                    cond = v2.substring(4, v2.length()).trim()
+                    continue
+                }
+                if v2 == "else" {
+                    else_body = _tpl_parse(toks, pos, ["end", "endif"])
+                    pos[0] = pos[0] + 1
+                }
+                break
+            }
+            nodes.append(["if", branches, else_body])
+        } elif w == "for" {
+            spec := val.substring(3, val.length()).trim()
+            at := spec.find(" in ")
+            if at < 0 { throw HttpError(500, "template: bad for: " + val) }
+            var := spec.substring(0, at).trim()
+            expr := spec.substring(at + 4, spec.length()).trim()
+            body := _tpl_parse(toks, pos, ["else", "end", "endfor"])
+            else_body := []
+            q: Int = pos[0]
+            if q < toks.length() {
+                t2: List = toks[q]
+                v2: String = t2[1]
+                pos[0] = q + 1
+                if v2 == "else" {
+                    else_body = _tpl_parse(toks, pos, ["end", "endfor"])
+                    pos[0] = pos[0] + 1
+                }
+            }
+            nodes.append(["for", var, expr, body, else_body])
+        } elif w == "include" {
+            file := val.substring(7, val.length()).trim()
+            if (file.startswith("\"") and file.endswith("\"")) or (file.startswith("'") and file.endswith("'")) {
+                file = file.substring(1, file.length() - 1)
+            }
+            nodes.append(["include", file])
+        } else {
+            throw HttpError(500, "template: unknown tag {% " + val + " %}")
+        }
+    }
+    return nodes
+}
+
+define _tpl_render(nodes: List, scopes: List, dir: String) -> String {
+    out := ""
+    for nd in nodes {
+        node: List = nd
+        kind: String = node[0]
+        if kind == "text" {
+            t: String = node[1]
+            out = out + t
+        } elif kind == "var" {
+            expr: String = node[1]
+            out = out + _tpl_output(expr, scopes)
+        } elif kind == "if" {
+            branches: List = node[1]
+            done := false
+            for b in branches {
+                br: List = b
+                cond: String = br[0]
+                if _tpl_truthy(_tpl_eval(cond, scopes)) {
+                    body: List = br[1]
+                    out = out + _tpl_render(body, scopes, dir)
+                    done = true
+                    break
+                }
+            }
+            if not done {
+                eb: List = node[2]
+                out = out + _tpl_render(eb, scopes, dir)
+            }
+        } elif kind == "for" {
+            var: String = node[1]
+            expr: String = node[2]
+            body: List = node[3]
+            seq := _tpl_eval(expr, scopes)
+            items := []
+            if seq != null and type(seq) == "List" {
+                items = seq
+            } elif seq != null and type(seq) == "Map" {
+                sm: Map = seq
+                items = sm.keys()
+            }
+            if items.length() == 0 {
+                eb: List = node[4]
+                out = out + _tpl_render(eb, scopes, dir)
+            } else {
+                i := 0
+                n := items.length()
+                for it in items {
+                    loop := {"index": i + 1, "index0": i, "first": i == 0, "last": i == n - 1, "length": n}
+                    frame := {}
+                    frame[var] = it
+                    frame["loop"] = loop
+                    inner := []
+                    for sc in scopes { inner.append(sc) }
+                    inner.append(frame)
+                    out = out + _tpl_render(body, inner, dir)
+                    i = i + 1
+                }
+            }
+        } elif kind == "include" {
+            file: String = node[1]
+            path := fs.join(dir, file)
+            if not fs.is_file(path) { throw HttpError(500, "template: include not found: " + path) }
+            sub := Template(fs.read_text(path), dir)
+            out = out + _tpl_render(sub.nodes, scopes, dir)
+        }
+    }
+    return out
+}
+
+// `{{ expr | filter | ... }}` as text (escaped unless `| raw`).
+define _tpl_output(expr: String, scopes: List) -> String {
+    parts := expr.split("|")
+    base: String = parts[0]
+    v := _tpl_eval(base.trim(), scopes)
+    raw := false
+    i := 1
+    while i < parts.length() {
+        fp: String = parts[i]
+        f := fp.trim()
+        if f == "raw" { raw = true }
+        elif f == "upper" { v = _tpl_str(v).upper() }
+        elif f == "lower" { v = _tpl_str(v).lower() }
+        elif f == "length" { v = _tpl_len(v) }
+        elif f == "json" {
+            v = json.dumps(v)
+        }
+        i = i + 1
+    }
+    s := _tpl_str(v)
+    return raw ? s : escape(s)
+}
+
+define _tpl_str(v: Any) -> String {
+    if v == null { return "" }
+    return String(v)
+}
+
+define _tpl_len(v: Any) -> Int {
+    if v == null { return 0 }
+    t := type(v)
+    if t == "List" {
+        l: List = v
+        return l.length()
+    }
+    if t == "Map" {
+        m: Map = v
+        return m.keys().length()
+    }
+    return String(v).length()
+}
+
+define _tpl_truthy(v: Any) -> Bool {
+    if v == null { return false }
+    t := type(v)
+    if t == "Bool" {
+        b: Bool = v
+        return b
+    }
+    if t == "Int" {
+        n: Int = v
+        return n != 0
+    }
+    if t == "String" {
+        s: String = v
+        return s != ""
+    }
+    if t == "List" or t == "Map" { return _tpl_len(v) > 0 }
+    return true
+}
+
+// Values: "text", 'text', numbers, true / false / null, dotted names; `not
+// x`, `a == b`, `a != b`.
+define _tpl_eval(expr: String, scopes: List) -> Any {
+    e := expr.trim()
+    if e.startswith("not ") { return not _tpl_truthy(_tpl_eval(e.substring(4, e.length()), scopes)) }
+    eq := e.find("==")
+    if eq > 0 { return _tpl_same(_tpl_eval(e.substring(0, eq), scopes), _tpl_eval(e.substring(eq + 2, e.length()), scopes)) }
+    ne := e.find("!=")
+    if ne > 0 { return not _tpl_same(_tpl_eval(e.substring(0, ne), scopes), _tpl_eval(e.substring(ne + 2, e.length()), scopes)) }
+    if e.length() >= 2 and ((e.startswith("\"") and e.endswith("\"")) or (e.startswith("'") and e.endswith("'"))) {
+        return e.substring(1, e.length() - 1)
+    }
+    if e == "true" { return true }
+    if e == "false" { return false }
+    if e == "null" or e == "" { return null }
+    if _hex_or_dec(e) >= 0 { return Int(e) }
+    names := e.split(".")
+    first: String = names[0]
+    cur: Any = null
+    found := false
+    k := scopes.length() - 1
+    while k >= 0 {
+        sc: Map = scopes[k]
+        if sc.has(first) {
+            cur = sc[first]
+            found = true
+            break
+        }
+        k = k - 1
+    }
+    if not found { return null }
+    j := 1
+    while j < names.length() {
+        key: String = names[j]
+        if cur == null { return null }
+        t := type(cur)
+        if t == "Map" {
+            m: Map = cur
+            if not m.has(key) { return null }
+            cur = m[key]
+        } elif t == "List" {
+            l: List = cur
+            if key == "length" {
+                cur = l.length()
+            } elif _hex_or_dec(key) >= 0 {
+                idx := Int(key)
+                if idx >= l.length() { return null }
+                cur = l[idx]
+            } else {
+                return null
+            }
+        } elif key == "length" {
+            cur = String(cur).length()
+        } else {
+            return null
+        }
+        j = j + 1
+    }
+    return cur
+}
+
+define _tpl_same(a: Any, b: Any) -> Bool {
+    if a == null or b == null { return a == null and b == null }
+    return String(a) == String(b)
+}
+
+// ===== testing =====
+
+---
+Call an app's routes without a network, for tests:
+
+    client := web.TestClient(app)
+    res := client.get("/users/1")
+    test.assert_eq(res.status_code, 200)
+    test.assert_eq(res.body, "...")
+
+Cookies the app sets are sent back on later requests, like a browser.
+---
+struct TestClient {
+    app: App
+    cookies: Map
+
+    define __init(self, app: App) -> void {
+        self.app = app
+        self.cookies = {}
+    }
+
+    define request(self, method: String, path: String, body: String = "", headers: Map = {}) -> Response {
+        hs := {}
+        for k in headers.keys() {
+            key: String = k
+            hs[key] = headers[key]
+        }
+        if self.cookies.keys().length() > 0 and not hs.has("Cookie") {
+            parts := []
+            for k in self.cookies.keys() {
+                key: String = k
+                v: String = self.cookies[key]
+                parts.append(key + "=" + url.quote(v))
+            }
+            hs["Cookie"] = "; ".join(parts)
+        }
+        if body != "" and not hs.has("Content-Length") { hs["Content-Length"] = String(byte_length(body)) }
+        req := Request(method, path, hs, body)
+        req.ip = "127.0.0.1"
+        res := Response(req)
+        self.app.handle(req, res)
+        for h in res._headers {
+            pair: List = h
+            hn: String = pair[0]
+            if hn.lower() == "set-cookie" {
+                hv: String = pair[1]
+                semi := hv.find(";")
+                kv := semi >= 0 ? hv.substring(0, semi) : hv
+                eq := kv.find("=")
+                if eq > 0 {
+                    ck := kv.substring(0, eq)
+                    cv := url.unquote(kv.substring(eq + 1, kv.length()))
+                    if hv.contains("Max-Age=0") { self.cookies.remove(ck) } else { self.cookies[ck] = cv }
+                }
+            }
+        }
+        return res
+    }
+
+    define get(self, path: String, headers: Map = {}) -> Response { return self.request("GET", path, "", headers) }
+    define delete(self, path: String, headers: Map = {}) -> Response { return self.request("DELETE", path, "", headers) }
+    define post(self, path: String, body: String = "", headers: Map = {}) -> Response { return self.request("POST", path, body, headers) }
+    define put(self, path: String, body: String = "", headers: Map = {}) -> Response { return self.request("PUT", path, body, headers) }
+
+    --- POST `value` as JSON. ---
+    define post_json(self, path: String, value: Any) -> Response {
+        return self.request("POST", path, json.dumps(value), {"Content-Type": "application/json"})
+    }
+
+    --- POST a form (a Map of Strings, urlencoded). ---
+    define post_form(self, path: String, fields: Map) -> Response {
+        parts := []
+        for k in fields.keys() {
+            key: String = k
+            v := String(fields[key])
+            parts.append(url.quote(key) + "=" + url.quote(v))
+        }
+        return self.request("POST", path, "&".join(parts), {"Content-Type": "application/x-www-form-urlencoded"})
+    }
+}
