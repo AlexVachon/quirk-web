@@ -278,6 +278,8 @@ struct Response {
     _headers: List
     _req: Request
     _app: App
+    _fd: Int              // the connection (-1: a TestClient's response)
+    _stream: EventStream  // res.event_stream()'s, once started
 
     define __init(self, req: Request = null) -> void {
         self.status_code = 200
@@ -287,6 +289,43 @@ struct Response {
         self._headers = []
         self._req = req
         self._app = null
+        self._fd = -1
+        self._stream = null
+    }
+
+    ---
+    Keep the connection open and send events as they happen (Server-Sent
+    Events — the browser's `EventSource`). The handler keeps running:
+
+        app.get("/clock", fn(req, res) {
+            stream := res.event_stream()
+            while stream.open {
+                stream.send("time", String(sys.now_ms()))
+                sys.sleep(1000)
+            }
+        })
+
+    `stream.open` turns false once the visitor is gone (a send failed).
+    ---
+    define event_stream(self) -> EventStream {
+        if self._stream != null { return self._stream }
+        self.sent = true
+        self.keep_alive = false
+        st := EventStream(self)
+        self._stream = st
+        if self._fd >= 0 {
+            out := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n"
+            for h in self._headers {
+                pair: List = h
+                hn: String = pair[0]
+                if hn.lower() == "content-type" or hn.lower() == "content-length" or hn.lower() == "connection" { continue }
+                hv: String = pair[1]
+                out = out + hn + ": " + hv.replace("\r", "").replace("\n", "") + "\r\n"
+            }
+            out = out + "Date: " + http_date(now()) + "\r\nConnection: keep-alive\r\n\r\n: open\n\n"
+            if send_all(self._fd, out) < 0 { st.open = false }
+        }
+        return st
     }
 
     --- Set the status code (chainable: `res.status(404).text("nope")`). ---
@@ -476,6 +515,55 @@ struct Response {
 
     define __str(self) -> String {
         return "Response(" + String(self.status_code) + ")"
+    }
+}
+
+// ===== event streams =====
+
+---
+An open Server-Sent Events stream (Response.event_stream()). In a
+TestClient, what's sent is kept in `sent`: a List of [event, data].
+---
+struct EventStream {
+    open: Bool
+    sent: List
+    _res: Response
+
+    define __init(self, res: Response) -> void {
+        self.open = true
+        self.sent = []
+        self._res = res
+    }
+
+    --- Send `data` as event `event` ("message" is EventSource's default); false once the visitor is gone. ---
+    define send(self, event: String, data: String, id: String = "") -> Bool {
+        if not self.open { return false }
+        if self._res._fd < 0 {
+            self.sent.append([event, data])
+            return true
+        }
+        out := ""
+        if id != "" { out = out + "id: " + id.replace("\n", "") + "\n" }
+        if event != "" and event != "message" { out = out + "event: " + event.replace("\n", "") + "\n" }
+        for line in data.split("\n") {
+            l: String = line
+            out = out + "data: " + l.replace("\r", "") + "\n"
+        }
+        if send_all(self._res._fd, out + "\n") < 0 { self.open = false }
+        return self.open
+    }
+
+    --- A comment line, to keep the connection (and proxies) awake — and to notice the visitor left. ---
+    define ping(self) -> Bool {
+        if not self.open { return false }
+        if self._res._fd < 0 { return true }
+        if send_all(self._res._fd, ": ping\n\n") < 0 { self.open = false }
+        return self.open
+    }
+
+    --- Stop: the connection closes when the handler returns. ---
+    define close(self) -> void {
+        self.open = false
     }
 }
 
@@ -1184,7 +1272,9 @@ async define _serve_connection(conn: Socket, app: App) {
             }
             res := Response(req)
             res.keep_alive = keep
+            res._fd = fd
             app.handle(req, res)
+            if res._stream != null { return }       // an event stream: written as it went; done
             if not res.keep_alive { keep = false }
             if send_all(fd, res._wire(req.method == "HEAD")) < 0 { return }
         }

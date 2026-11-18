@@ -1,0 +1,33 @@
+// web 1.2 — Server-Sent Events: res.event_stream(), stream.send / ping / close.
+use web
+use test
+
+define make_app() -> web.App {
+    app := web.App()
+    app.get("/count", fn(req, res) {
+        rs: web.Response = res
+        rs.set("X-Demo", "1")
+        stream := rs.event_stream()
+        i := 1
+        while stream.open and i <= 3 {
+            stream.send("tick", String(i))
+            i = i + 1
+        }
+        stream.send("message", "two\\nlines", id="9")
+        stream.close()
+        test.assert_false(stream.send("tick", "after close"))
+    })
+    return app
+}
+
+define test_events_in_a_test_client() -> void {
+    res := web.TestClient(make_app()).get("/count")
+    st := res._stream
+    test.assert_true(st != null)
+    test.assert_eq(st.sent.length(), 4)
+    first: List = st.sent[0]
+    test.assert_eq(first[0], "tick")
+    test.assert_eq(first[1], "1")
+    last: List = st.sent[3]
+    test.assert_eq(last[1], "two\\nlines")
+}

@@ -149,6 +149,27 @@ app.get("/account", fn(req, res) { res.text("Hello " + String(req.user())) })
   across restarts). `secure=true` behind HTTPS.
 - `web.TestClient` keeps cookies, so tests can log in.
 
+## Event streams
+
+Keep a response open and send events as they happen — Server-Sent
+Events, what the browser's `EventSource` reads:
+
+```quirk
+app.get("/clock", fn(req, res) {
+    stream := res.event_stream()
+    while stream.open {                       // false once the visitor is gone
+        stream.send("time", String(sys.now_ms()))
+        sys.sleep(1000)
+    }
+})
+```
+
+`stream.send(event, data, id="")` (multi-line data is fine), `stream.ping()`
+(a comment line: keeps proxies awake and notices a closed tab sooner),
+`stream.close()`. Each connection runs in its own task, so a stream doesn't
+hold up other requests. In a `TestClient`, what was sent is in
+`res._stream.sent`.
+
 ## Templates
 
 `views/page.html`:
@@ -197,8 +218,9 @@ built in yet — put a reverse proxy (Caddy, nginx) in front for TLS.
 
 ## Requirements
 
-Quirk 7.42.0 or newer (binary-safe sockets and files, the byte helpers
-in the runtime), and the `crypto` package (bundled with Quirk).
+Quirk 7.47.0 or newer (a closed connection no longer stops the server;
+`with` closes the socket on every way out), and the `crypto` package
+(bundled with Quirk).
 
 ## License
 
