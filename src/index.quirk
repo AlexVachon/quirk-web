@@ -26,6 +26,7 @@ use net.socket
 use encoding.json
 use url
 use fs
+use crypto
 from net.socket use { Socket }
 
 // ===== byte-level helpers (runtime: src/Runtime/libs/web.c) =====
@@ -129,6 +130,7 @@ struct Request {
     locals: Map
     ip: String
     _cookies: Map
+    _session: Session
 
     define __init(self, method: String, target: String, headers: Map = {}, body: String = "") -> void {
         self.method = method.upper()
@@ -154,6 +156,22 @@ struct Request {
         self.locals = {}
         self.ip = ""
         self._cookies = null
+        self._session = null
+    }
+
+    ---
+    The visitor's session (needs `app.use(web.sessions())`): values kept on
+    the server between their requests — `req.session().set("cart", items)`.
+    ---
+    define session(self) -> Session {
+        if self._session == null { throw HttpError(500, "web: req.session() needs app.use(web.sessions())") }
+        return self._session
+    }
+
+    --- Who's logged in (what `web.login(req, user)` stored), or null. ---
+    define user(self) -> Any {
+        if self._session == null { return null }
+        return self._session.get("user")
     }
 
     --- A header's value ("" if absent); the name is case-insensitive. ---
@@ -222,6 +240,12 @@ struct Request {
             return v
         }
         return ""
+    }
+
+    // The Accept header asks for JSON and not HTML (fetch / API clients).
+    define accepts_only_json(self) -> Bool {
+        acc := self.header("accept").lower()
+        return acc.contains("json") and not acc.contains("html")
     }
 
     --- True if the client accepts `kind` ("json", "html", or a full type) — from the Accept header. ---
@@ -602,6 +626,193 @@ struct _Chain {
             return
         }
         self.app._route(self.req, self.res)
+    }
+}
+
+// ===== sessions =====
+
+_session_store := {}
+_session_conf := {"secret": "", "minutes": 10080, "cookie": "quirk_session", "secure": false}
+_session_sweep := [0]
+
+---
+A visitor's session: values kept on the server between their requests.
+The browser only holds a random id, signed, in an HttpOnly cookie. Get it
+with `req.session()` (after `app.use(web.sessions())`).
+---
+struct Session {
+    id: String
+    data: Map
+    _new: Bool
+    _renamed: Bool
+    _destroyed: Bool
+    _seen: Int
+
+    define __init(self, id: String) -> void {
+        self.id = id
+        self.data = {}
+        self._new = true
+        self._renamed = false
+        self._destroyed = false
+        self._seen = 0
+    }
+
+    --- The value of `key`, or `default`. ---
+    define get(self, key: String, default: Any = null) -> Any {
+        if self.data.has(key) { return self.data[key] }
+        return default
+    }
+
+    define set(self, key: String, value: Any) -> void {
+        self.data[key] = value
+    }
+
+    define has(self, key: String) -> Bool {
+        return self.data.has(key)
+    }
+
+    define remove(self, key: String) -> void {
+        if self.data.has(key) { self.data.remove(key) }
+    }
+
+    --- Forget every value (the session itself stays). ---
+    define clear(self) -> void {
+        self.data = {}
+    }
+
+    ---
+    A new id for the same values — call it when someone logs in (web.login
+    does), so an id someone else saw before can't be used to act as them.
+    ---
+    define regenerate(self) -> void {
+        old := self.id
+        self.id = crypto.random_hex(16)
+        self._renamed = true
+        if _session_store.has(old) {
+            _session_store.remove(old)
+            _session_store[self.id] = self
+        }
+    }
+
+    --- End the session: its values go, and the browser's cookie is cleared. ---
+    define destroy(self) -> void {
+        self.data = {}
+        self._destroyed = true
+        if _session_store.has(self.id) { _session_store.remove(self.id) }
+    }
+}
+
+
+---
+Middleware for sessions — `app.use(web.sessions())`, then `req.session()`
+in handlers. Sessions live in the server's memory (they end when it
+restarts) and expire `minutes` after the visitor's last request (default:
+a week). `secret` signs the cookie; by default a random one is made when
+the server starts. `secure=true` sends the cookie over HTTPS only.
+---
+define sessions(secret: String = "", minutes: Int = 10080, cookie: String = "quirk_session", secure: Bool = false) -> Callable {
+    _session_conf["secret"] = secret != "" ? secret : crypto.random_hex(32)
+    _session_conf["minutes"] = minutes
+    _session_conf["cookie"] = cookie
+    _session_conf["secure"] = secure
+    return fn(req, res, next) {
+        r: Request = req
+        rs: Response = res
+        s := _session_for(r)
+        r._session = s
+        next()
+        _session_after(s, rs)
+    }
+}
+
+define _session_sign(id: String) -> String {
+    return id + "." + crypto.hmac_sha256(String(_session_conf["secret"]), id).substring(0, 32)
+}
+
+// The session the request's cookie names, or a new one (stored once it has values).
+define _session_for(r: Request) -> Session {
+    now := now() * 1000
+    ttl := Int(_session_conf["minutes"]) * 60 * 1000
+    if now - Int(_session_sweep[0]) > 60000 {
+        _session_sweep[0] = now
+        stale := []
+        for k in _session_store.keys() {
+            key: String = k
+            old: Session = _session_store[key]
+            if now - old._seen > ttl { stale.append(key) }
+        }
+        for k in stale { _session_store.remove(String(k)) }
+    }
+    raw := r.cookie(String(_session_conf["cookie"]))
+    dot := raw.find(".")
+    if dot > 0 {
+        id := raw.substring(0, dot)
+        if _session_sign(id) == raw and _session_store.has(id) {
+            s: Session = _session_store[id]
+            if now - s._seen <= ttl {
+                s._seen = now
+                return s
+            }
+            _session_store.remove(id)
+        }
+    }
+    s := Session(crypto.random_hex(16))
+    s._seen = now
+    return s
+}
+
+// After the handler: store a new session that got values, (re)send or clear the cookie.
+define _session_after(s: Session, rs: Response) -> void {
+    name := String(_session_conf["cookie"])
+    secure: Bool = _session_conf["secure"]
+    if s._destroyed {
+        rs.clear_cookie(name)
+        return
+    }
+    if s._new and s.data.keys().length() == 0 { return }
+    _session_store[s.id] = s
+    if s._new or s._renamed {
+        rs.cookie(name, _session_sign(s.id), max_age=Int(_session_conf["minutes"]) * 60, secure=secure)
+        s._new = false
+        s._renamed = false
+    }
+}
+
+--- How many sessions the server holds. ---
+define session_count() -> Int {
+    return _session_store.keys().length()
+}
+
+--- Log `user` in (any value: a name, a Map, a struct): a new session id, then `user` stored. ---
+define login(req: Request, user: Any) -> void {
+    s := req.session()
+    s.regenerate()
+    s.set("user", user)
+}
+
+--- Log out: the session ends (its values go, the cookie is cleared). ---
+define logout(req: Request) -> void {
+    req.session().destroy()
+}
+
+---
+Middleware that lets only logged-in visitors through — `app.use(web.require_login(), path="/admin")`.
+A page request is sent to `redirect` (with `?next=` the page it wanted);
+anything else (an API call, a form post) gets 401.
+---
+define require_login(redirect: String = "/login") -> Callable {
+    return fn(req, res, next) {
+        r: Request = req
+        rs: Response = res
+        if r.user() != null {
+            next()
+            return
+        }
+        if r.method == "GET" and r.accepts("html") and not r.accepts_only_json() {
+            rs.redirect(redirect + "?next=" + url.quote(r.url))
+            return
+        }
+        rs.status(401).json({"error": "login required"})
     }
 }
 

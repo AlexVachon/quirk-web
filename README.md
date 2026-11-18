@@ -112,6 +112,43 @@ app.on_error(fn(err, req, res) { res.status(500).json({"error": err.message}) })
 app.on_not_found(fn(req, res) { res.status(404).render("404.html") })
 ```
 
+## Sessions and login
+
+```quirk
+app.use(web.sessions())
+
+app.post("/login", fn(req, res) {
+    f := req.form()
+    if not check_password(f["name"], f["password"]) { throw web.HttpError(403, "wrong password") }
+    web.login(req, f["name"])                 // a new session id, then the user stored
+    res.redirect("/account")
+})
+app.post("/logout", fn(req, res) {
+    web.logout(req)                           // the session ends, the cookie is cleared
+    res.redirect("/")
+})
+
+app.use(web.require_login(), path="/account") // logged-in visitors only
+app.get("/account", fn(req, res) { res.text("Hello " + String(req.user())) })
+```
+
+- `req.session()` is the visitor's session: `get(key, default)`, `set`,
+  `has`, `remove`, `clear`, `regenerate()`, `destroy()`. Its values stay on
+  the server; the browser holds only a random id, signed, in an HttpOnly,
+  SameSite=Lax cookie — sent only once the session has something in it.
+- `web.login(req, user)` stores any value (a name, a Map) as `req.user()`,
+  after giving the session a new id (an id seen before logging in can't be
+  used to act as the user).
+- `web.require_login(redirect="/login")` sends a page request to
+  `/login?next=<the page>`, and answers anything else (an API call, a form
+  post) with 401.
+- `web.sessions(secret=…, minutes=10080, cookie="quirk_session",
+  secure=false)`: sessions live in the server's memory and end when it
+  restarts, or `minutes` after the visitor's last request. `secret` signs
+  the cookie (random per start by default; set one to keep cookies valid
+  across restarts). `secure=true` behind HTTPS.
+- `web.TestClient` keeps cookies, so tests can log in.
+
 ## Templates
 
 `views/page.html`:
@@ -161,7 +198,7 @@ built in yet — put a reverse proxy (Caddy, nginx) in front for TLS.
 ## Requirements
 
 Quirk 7.42.0 or newer (binary-safe sockets and files, the byte helpers
-in the runtime).
+in the runtime), and the `crypto` package (bundled with Quirk).
 
 ## License
 

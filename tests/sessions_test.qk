@@ -1,0 +1,125 @@
+// web 1.1 — sessions (server-side, signed cookie), login / logout, require_login.
+use web
+use test
+use encoding.json
+
+define make_app() -> web.App {
+    app := web.App()
+    app.use(web.sessions(secret="test-secret"))
+    app.get("/count", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        s := r.session()
+        n := Int(s.get("n", 0)) + 1
+        s.set("n", n)
+        rs.text(String(n))
+    })
+    app.get("/peek", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        rs.text(r.session().has("n") ? "has" : "empty")
+    })
+    app.post("/login", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        f := r.form()
+        if String(f["password"]) != "secret" { throw web.HttpError(403, "wrong password") }
+        web.login(r, String(f["name"]))
+        rs.text("hello " + String(r.user()))
+    })
+    app.post("/logout", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        web.logout(r)
+        rs.text("bye")
+    })
+    app.use(web.require_login(), path="/admin")
+    app.get("/admin", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        rs.text("admin for " + String(r.user()))
+    })
+    app.get("/admin/api", fn(req, res) {
+        rs: web.Response = res
+        rs.json({"ok": true})
+    })
+    return app
+}
+
+define test_values_kept_per_visitor() -> void {
+    app := make_app()
+    a := web.TestClient(app)
+    b := web.TestClient(app)
+    test.assert_eq(a.get("/count").body, "1")
+    test.assert_eq(a.get("/count").body, "2")
+    test.assert_eq(b.get("/count").body, "1")                         // another visitor
+    test.assert_eq(a.get("/count").body, "3")
+    test.assert_true(String(a.cookies["quirk_session"]).contains("."))  // id.signature
+}
+
+define test_no_cookie_until_there_is_something_to_keep() -> void {
+    c := web.TestClient(make_app())
+    res := c.get("/peek")
+    test.assert_eq(res.body, "empty")
+    test.assert_false(c.cookies.has("quirk_session"))
+}
+
+define test_forged_or_unknown_cookies_start_a_new_session() -> void {
+    app := make_app()
+    c := web.TestClient(app)
+    c.get("/count")
+    c.get("/count")
+    good: String = c.cookies["quirk_session"]
+    id := good.substring(0, good.find("."))
+    c.cookies["quirk_session"] = id + ".0000000000000000000000000000000"   // bad signature
+    test.assert_eq(c.get("/count").body, "1")
+    c.cookies["quirk_session"] = "nonsense"
+    test.assert_eq(c.get("/count").body, "1")
+}
+
+define test_login_regenerates_and_logout_ends() -> void {
+    c := web.TestClient(make_app())
+    c.get("/count")
+    before: String = c.cookies["quirk_session"]
+    test.assert_eq(c.post_form("/login", {"name": "ada", "password": "nope"}).status_code, 403)
+    res := c.post_form("/login", {"name": "ada", "password": "secret"})
+    test.assert_eq(res.body, "hello ada")
+    after: String = c.cookies["quirk_session"]
+    test.assert_true(after != before)                                  // a new id after login
+    test.assert_eq(c.get("/count").body, "2")                          // the values came along
+    test.assert_eq(c.get("/admin").body, "admin for ada")
+    c.post("/logout")
+    test.assert_false(c.cookies.has("quirk_session"))                  // cleared
+    test.assert_eq(c.get("/admin").status_code, 302)
+}
+
+define test_require_login() -> void {
+    c := web.TestClient(make_app())
+    page := c.get("/admin?tab=2", {"Accept": "text/html"})
+    test.assert_eq(page.status_code, 302)
+    test.assert_eq(page.get("Location"), "/login?next=%2Fadmin%3Ftab%3D2")
+    api := c.get("/admin/api", {"Accept": "application/json"})
+    test.assert_eq(api.status_code, 401)
+    m: Map = json.loads(api.body)
+    test.assert_eq(m["error"], "login required")
+    c.post_form("/login", {"name": "bob", "password": "secret"})
+    test.assert_eq(c.get("/admin/api", {"Accept": "application/json"}).status_code, 200)
+}
+
+define test_session_without_middleware_is_a_clear_error() -> void {
+    app := web.App()
+    app.get("/", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        rs.text(String(r.session().get("x", "none")))
+    })
+    res := web.TestClient(app).get("/")
+    test.assert_eq(res.status_code, 500)                               // the message goes to the log
+    caught := ""
+    try {
+        web.Request("GET", "/").session()
+    } catch (e: web.HttpError) {
+        caught = e.message
+    }
+    test.assert_true(caught.contains("needs app.use(web.sessions())"), caught)
+}
