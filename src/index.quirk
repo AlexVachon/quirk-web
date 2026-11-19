@@ -835,7 +835,8 @@ define _session_for(r: Request) -> Session {
     dot := raw.find(".")
     if dot > 0 {
         id := raw.substring(0, dot)
-        if _session_sign(id) == raw and _session_store.has(id) {
+        // (constant time: with ==, the time taken tells how much of a forged signature was right)
+        if crypto.equal(_session_sign(id), raw) and _session_store.has(id) {
             s: Session = _session_store[id]
             if now - s._seen <= ttl {
                 s._seen = now
