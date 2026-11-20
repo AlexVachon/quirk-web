@@ -240,10 +240,34 @@ Content-Length or chunked, `app.max_body` (10 MB) and an idle timeout
 other machines. HTTPS, HTTP/2, WebSockets and multipart uploads aren't
 built in yet — put a reverse proxy (Caddy, nginx) in front for TLS.
 
+## Deploying
+
+```sh
+quirk bundle main.qk -o dist --docker     # dist/: the app, its runtime, its files, a Dockerfile
+cd dist && ./main                         # runs there with no Quirk installed
+```
+
+`quirk bundle` builds the app to a native binary with the runtime next to it,
+and copies what it reads from its folder (`index.html`, `public/`, `views/`,
+templates) — never `.db` files. Run it from that folder. In production:
+
+- **The address.** `app.listen` serves `127.0.0.1` (this machine only) unless
+  `host=` says otherwise or `QUIRK_HOST` is set — `QUIRK_HOST=0.0.0.0` in a
+  container (the generated Dockerfile sets it), or put a reverse proxy (Caddy,
+  nginx) in front.
+- **HTTPS.** Behind a proxy that does TLS, give sessions `secure=true`, so the
+  cookie is never sent over plain HTTP.
+- **The session secret.** Set `QUIRK_SESSION_SECRET` (a long random string:
+  `openssl rand -hex 32`) — required when several servers share the sessions;
+  with `web.sqlite_store` and one server, the store's own secret is enough.
+- **Data.** A SQLite database the app writes lives in its folder: on a server,
+  keep it out of the bundle (it is) and back it up; in a container, put it on a
+  volume.
+
 ## Requirements
 
-Quirk 7.56.0 or newer, and the `crypto` and `sqlite` packages (bundled
-with Quirk).
+Quirk 7.56.0 or newer (`quirk bundle`, to deploy: 7.58.0), and the `crypto`
+and `sqlite` packages (bundled with Quirk).
 
 ## License
 

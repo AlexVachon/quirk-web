@@ -1246,10 +1246,18 @@ struct App {
 
     ---
     Serve the app on `port` (and `host`: "127.0.0.1" only this machine,
-    "0.0.0.0" every interface) until `stop()`. Each connection is handled
-    in its own task, with keep-alive. `on_ready()` runs once listening.
+    "0.0.0.0" every interface; the default is $QUIRK_HOST when it's set)
+    until `stop()`. Each connection is handled in its own task, with
+    keep-alive. `on_ready()` runs once listening.
     ---
     define listen(self, port: Int = 3000, host: String = "127.0.0.1", on_ready: Callable = null, quiet: Bool = false) -> void {
+        // In a container the app must listen on every address (0.0.0.0),
+        // not only the container's own 127.0.0.1: $QUIRK_HOST changes the
+        // default (a host= given still wins). `quirk bundle --docker` sets it.
+        if host == "127.0.0.1" {
+            from_env := sys.getenv("QUIRK_HOST")
+            if from_env != "" { host = from_env }
+        }
         with Socket() as listener {
             listener.bind(host, port)
             listener.listen(128)

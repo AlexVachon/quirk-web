@@ -1,5 +1,5 @@
 name          = "web"
-version       = "1.3.0"
+version       = "1.3.1"
 license       = "MIT"
 description   = "Build web apps and HTTP APIs, Express-style: routes with :params, middleware, JSON / forms / cookies, sessions and login, event streams (SSE), static files, templates, keep-alive server, TestClient."
 repository    = "github.com/AlexVachon/quirk-web"
