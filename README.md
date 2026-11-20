@@ -142,12 +142,36 @@ app.get("/account", fn(req, res) { res.text("Hello " + String(req.user())) })
 - `web.require_login(redirect="/login")` sends a page request to
   `/login?next=<the page>`, and answers anything else (an API call, a form
   post) with 401.
-- `web.sessions(secret=…, minutes=10080, cookie="quirk_session",
-  secure=false)`: sessions live in the server's memory and end when it
-  restarts, or `minutes` after the visitor's last request. `secret` signs
-  the cookie (random per start by default; set one to keep cookies valid
-  across restarts). `secure=true` behind HTTPS.
+- `web.sessions(store=…, secret=…, minutes=10080, cookie="quirk_session",
+  secure=false)`: sessions end `minutes` after the visitor's last request.
+  `secure=true` behind HTTPS (in production).
 - `web.TestClient` keeps cookies, so tests can log in.
+
+### Sessions that last across restarts
+
+By default sessions live in the server's memory: a restart — a deploy, or
+every save under `quirk run --watch` — logs everyone out. Keep them in SQLite
+instead:
+
+```quirk
+app.use(web.sessions(store=web.sqlite_store("sessions.db")))   // a file of their own
+app.use(web.sessions(store=web.sqlite_store(db=db())))          // or the app's database
+```
+
+- They're in a `quirk_sessions` table (plus `quirk_session_meta`), made if it
+  isn't there; the app's own `db.migrate` version isn't touched.
+- Their values are kept as JSON: Strings, numbers, Bools, null, Lists and
+  Maps (to keep a struct, keep its fields).
+- A request writes only when the session's values changed, or once a minute
+  to note it's still in use. Expired sessions are swept.
+- A store of your own: a struct extending `web.SessionStore` (`load`, `save`,
+  `remove`, `sweep`, `count`, `secret`).
+
+**The secret** that signs the cookie, in this order: `secret=` if given; else
+the `QUIRK_SESSION_SECRET` environment variable; else one the SQLite store
+makes once and keeps in its database (cookies stay valid across restarts with
+nothing to set up); else, for memory sessions, a new random one each start. Set
+`QUIRK_SESSION_SECRET` (or `secret=`) when several servers share the sessions.
 
 ## Event streams
 
@@ -218,9 +242,8 @@ built in yet — put a reverse proxy (Caddy, nginx) in front for TLS.
 
 ## Requirements
 
-Quirk 7.47.0 or newer (a closed connection no longer stops the server;
-`with` closes the socket on every way out), and the `crypto` package
-(bundled with Quirk).
+Quirk 7.56.0 or newer, and the `crypto` and `sqlite` packages (bundled
+with Quirk).
 
 ## License
 

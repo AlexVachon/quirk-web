@@ -1,0 +1,127 @@
+// web 1.3 — where sessions are kept: memory (the default) or SQLite (they
+// last across restarts); the signing secret the store keeps.
+use web
+use test
+use fs
+use sqlite
+
+define make_app(store: web.SessionStore, secret: String = "") -> web.App {
+    app := web.App()
+    app.use(web.sessions(secret=secret, store=store))
+    app.get("/count", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        s := r.session()
+        n := Int(s.get("n", 0)) + 1
+        s.set("n", n)
+        rs.text(String(n))
+    })
+    app.get("/peek", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        rs.text(String(r.session().get("n", 0)))
+    })
+    app.get("/things", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        s := r.session()
+        if not s.has("things") { s.set("things", {"tags": ["a", "b"], "on": true, "ratio": 0.5, "none": null}) }
+        t: Map = s.get("things")
+        tags: List = t["tags"]
+        rs.text(String(tags.length()) + " " + String(t["on"]) + " " + String(t["ratio"]) + " " + String(t["none"] == null))
+    })
+    app.post("/login", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        web.login(r, "ada")
+        rs.text("in")
+    })
+    app.post("/logout", fn(req, res) {
+        r: web.Request = req
+        rs: web.Response = res
+        web.logout(r)
+        rs.text("out")
+    })
+    return app
+}
+
+// A browser that keeps its cookies when the server restarts.
+define same_browser(app: web.App, before: web.TestClient) -> web.TestClient {
+    c := web.TestClient(app)
+    for k in before.cookies.keys() { c.cookies[String(k)] = before.cookies[String(k)] }
+    return c
+}
+
+define test_sqlite_sessions_last_across_restarts() -> void {
+    dir := fs.temp_dir(prefix="quirk-web-sessions-")
+    path := fs.join(dir, "sessions.db")
+    a := web.TestClient(make_app(web.sqlite_store(path)))
+    test.assert_eq(a.get("/count").body, "1")
+    test.assert_eq(a.get("/count").body, "2")
+    test.assert_eq(web.session_count(), 1)
+    // The server restarts: a new app, a new store on the same file — and no secret given.
+    b := same_browser(make_app(web.sqlite_store(path)), a)
+    test.assert_eq(b.get("/count").body, "3")                  // still the same session
+    test.assert_eq(b.get("/things").body, "2 true 0.5 true")   // values as JSON: Lists, Maps, Bools, Doubles, null
+    c := same_browser(make_app(web.sqlite_store(path)), b)
+    test.assert_eq(c.get("/things").body, "2 true 0.5 true")   // and back
+    test.assert_eq(c.get("/peek").body, "3")
+    fs.remove_tree(dir)
+}
+
+define test_memory_sessions_end_with_the_server() -> void {
+    a := web.TestClient(make_app(web.memory_store()))
+    test.assert_eq(a.get("/count").body, "1")
+    test.assert_eq(a.get("/count").body, "2")
+    b := same_browser(make_app(web.memory_store()), a)        // restarted
+    test.assert_eq(b.get("/count").body, "1")                  // a new session
+}
+
+define test_login_logout_and_the_rows() -> void {
+    db := sqlite.open(":memory:")                              // the app's own database, shared
+    db.migrate(["CREATE TABLE things (x INTEGER)"])
+    a := web.TestClient(make_app(web.sqlite_store(db=db)))
+    a.get("/count")
+    before := String(db.value("SELECT id FROM quirk_sessions"))
+    a.post_form("/login", {})
+    after := String(db.value("SELECT id FROM quirk_sessions"))
+    test.assert_true(before != after)                          // a new id at login…
+    test.assert_eq(Int(db.value("SELECT count(*) FROM quirk_sessions")), 1)   // …and the old row gone
+    test.assert_eq(a.get("/count").body, "2")                  // the values kept
+    a.post_form("/logout", {})
+    test.assert_eq(Int(db.value("SELECT count(*) FROM quirk_sessions")), 0)
+    test.assert_eq(db.schema_version(), 1)                     // migrate's version untouched
+    test.assert_eq(", ".join(db.tables()), "quirk_session_meta, quirk_sessions, things")
+}
+
+define test_writes_only_what_changed_and_expiry() -> void {
+    db := sqlite.open(":memory:")
+    a := web.TestClient(make_app(web.sqlite_store(db=db)))
+    a.get("/count")
+    db.execute("UPDATE quirk_sessions SET seen = seen - 1000")    // (to see whether it's written again)
+    marked := Int(db.value("SELECT seen FROM quirk_sessions"))
+    test.assert_eq(a.get("/peek").body, "1")
+    test.assert_eq(Int(db.value("SELECT seen FROM quirk_sessions")), marked)   // nothing changed: not written
+    a.get("/count")
+    test.assert_true(Int(db.value("SELECT seen FROM quirk_sessions")) > marked) // changed: written
+    // Last seen longer ago than `minutes`: refused, and swept.
+    db.execute("UPDATE quirk_sessions SET seen = 0")
+    test.assert_eq(a.get("/peek").body, "0")                   // a new session
+    store := web.sqlite_store(db=db)
+    store.sweep(1)
+    test.assert_eq(store.count(), 0)
+}
+
+define test_the_secret() -> void {
+    db := sqlite.open(":memory:")
+    s1 := web.sqlite_store(db=db).secret()
+    s2 := web.sqlite_store(db=db).secret()
+    test.assert_eq(s1.length(), 64)
+    test.assert_eq(s1, s2)                                     // made once, kept
+    test.assert_eq(web.memory_store().secret(), "")            // memory: none (a new one each start)
+    // A secret given wins: the store's doesn't sign then.
+    a := web.TestClient(make_app(web.sqlite_store(db=db), secret="given"))
+    a.get("/count")
+    b := same_browser(make_app(web.sqlite_store(db=db)), a)    // restarted with the store's secret
+    test.assert_eq(b.get("/count").body, "1")                  // that cookie isn't valid under another secret
+}

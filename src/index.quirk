@@ -27,6 +27,8 @@ use encoding.json
 use url
 use fs
 use crypto
+use sys
+use sqlite
 from net.socket use { Socket }
 
 // ===== byte-level helpers (runtime: src/Runtime/libs/web.c) =====
@@ -719,9 +721,9 @@ struct _Chain {
 
 // ===== sessions =====
 
-_session_store := {}
 _session_conf := {"secret": "", "minutes": 10080, "cookie": "quirk_session", "secure": false}
 _session_sweep := [0]
+_session_stores := []          // [the SessionStore] (set by sessions(); memory by default)
 
 ---
 A visitor's session: values kept on the server between their requests.
@@ -735,6 +737,8 @@ struct Session {
     _renamed: Bool
     _destroyed: Bool
     _seen: Int
+    _stored: String        // a persistent store: the data as last written (JSON)
+    _stored_seen: Int      //   and when it was last written
 
     define __init(self, id: String) -> void {
         self.id = id
@@ -743,6 +747,8 @@ struct Session {
         self._renamed = false
         self._destroyed = false
         self._seen = 0
+        self._stored = ""
+        self._stored_seen = 0
     }
 
     --- The value of `key`, or `default`. ---
@@ -776,30 +782,204 @@ struct Session {
         old := self.id
         self.id = crypto.random_hex(16)
         self._renamed = true
-        if _session_store.has(old) {
-            _session_store.remove(old)
-            _session_store[self.id] = self
-        }
+        self._stored = ""
+        if not self._new { _session_store().remove(old) }
     }
 
     --- End the session: its values go, and the browser's cookie is cleared. ---
     define destroy(self) -> void {
         self.data = {}
         self._destroyed = true
-        if _session_store.has(self.id) { _session_store.remove(self.id) }
+        _session_store().remove(self.id)
     }
 }
 
+---
+Where sessions are kept: `web.memory_store()` (the default — the server's
+memory: they end when it restarts) or `web.sqlite_store(...)` (a SQLite
+database: they last across restarts and deploys). A store of your own is a
+struct with these methods.
+---
+struct SessionStore {
+    --- The session with this id, or null. ---
+    define load(self, id: String) -> Session {
+        return null
+    }
+
+    --- Keep `s` (new, or changed). ---
+    define save(self, s: Session) -> void {
+    }
+
+    define remove(self, id: String) -> void {
+    }
+
+    --- Forget the sessions last seen before `before` (ms since 1970). ---
+    define sweep(self, before: Int) -> void {
+    }
+
+    define count(self) -> Int {
+        return 0
+    }
+
+    --- A secret it keeps for signing cookies, so it lasts as long as the sessions do ("" for none). ---
+    define secret(self) -> String {
+        return ""
+    }
+}
+
+--- Sessions in the server's memory (the default). ---
+struct MemoryStore : SessionStore {
+    sessions: Map
+
+    define __init(self) -> void {
+        self.sessions = {}
+    }
+
+    define load(self, id: String) -> Session {
+        if not self.sessions.has(id) { return null }
+        s: Session = self.sessions[id]
+        return s
+    }
+
+    define save(self, s: Session) -> void {
+        self.sessions[s.id] = s
+    }
+
+    define remove(self, id: String) -> void {
+        if self.sessions.has(id) { self.sessions.remove(id) }
+    }
+
+    define sweep(self, before: Int) -> void {
+        stale := []
+        for k in self.sessions.keys() {
+            key: String = k
+            s: Session = self.sessions[key]
+            if s._seen < before { stale.append(key) }
+        }
+        for k in stale { self.sessions.remove(String(k)) }
+    }
+
+    define count(self) -> Int {
+        return self.sessions.keys().length()
+    }
+}
+
+---
+Sessions in a SQLite database (tables `quirk_sessions` and
+`quirk_session_meta`, made if they aren't there — it can be your app's own
+database: `db.migrate` isn't affected). Their values are kept as JSON:
+Strings, numbers, Bools, null, Lists and Maps (a struct, store its fields).
+---
+struct SqliteStore : SessionStore {
+    db: sqlite.Database
+
+    define __init(self, db: sqlite.Database) -> void {
+        self.db = db
+        db.script("""
+            CREATE TABLE IF NOT EXISTS quirk_sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, seen INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS quirk_sessions_seen ON quirk_sessions (seen);
+            CREATE TABLE IF NOT EXISTS quirk_session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
+    }
+
+    define load(self, id: String) -> Session {
+        row := self.db.query_one("SELECT data, seen FROM quirk_sessions WHERE id = ?", [id])
+        if row == null { return null }
+        s := Session(id)
+        text := String(row["data"])
+        parsed := json.loads(text)
+        if parsed is Map {
+            m: Map = parsed
+            s.data = m
+        }
+        s._seen = Int(row["seen"])
+        s._new = false
+        s._stored = text
+        s._stored_seen = s._seen
+        return s
+    }
+
+    // Written when its values changed — or, to note it's still in use, at
+    // most once a minute: a request that changes nothing writes nothing.
+    define save(self, s: Session) -> void {
+        text := json.dumps(s.data)
+        if text == s._stored and s._seen - s._stored_seen < 60000 { return }
+        self.db.execute("INSERT INTO quirk_sessions (id, data, seen) VALUES (?, ?, ?) ON CONFLICT (id) DO UPDATE SET data = excluded.data, seen = excluded.seen",
+                        [s.id, text, s._seen])
+        s._stored = text
+        s._stored_seen = s._seen
+    }
+
+    define remove(self, id: String) -> void {
+        self.db.execute("DELETE FROM quirk_sessions WHERE id = ?", [id])
+    }
+
+    define sweep(self, before: Int) -> void {
+        self.db.execute("DELETE FROM quirk_sessions WHERE seen < ?", [before])
+    }
+
+    define count(self) -> Int {
+        return Int(self.db.value("SELECT count(*) FROM quirk_sessions"))
+    }
+
+    // Made once, then kept with the sessions: cookies stay valid across restarts.
+    define secret(self) -> String {
+        found := self.db.value("SELECT value FROM quirk_session_meta WHERE key = 'secret'")
+        if found != null { return String(found) }
+        made := crypto.random_hex(32)
+        self.db.execute("INSERT OR IGNORE INTO quirk_session_meta (key, value) VALUES ('secret', ?)", [made])
+        return String(self.db.value("SELECT value FROM quirk_session_meta WHERE key = 'secret'"))
+    }
+}
+
+--- Sessions in the server's memory: they end when it restarts (the default). ---
+define memory_store() -> SessionStore {
+    return MemoryStore()
+}
+
+---
+Sessions in a SQLite database — they last across restarts. `path`: a file
+of their own (opened here); or `db`: your app's open database, shared.
+
+    app.use(web.sessions(store=web.sqlite_store("sessions.db")))
+    app.use(web.sessions(store=web.sqlite_store(db=db())))
+---
+define sqlite_store(path: String = "sessions.db", db: sqlite.Database = null) -> SessionStore {
+    if db != null { return SqliteStore(db) }
+    return SqliteStore(sqlite.open(path))
+}
+
+define _session_store() -> SessionStore {
+    if _session_stores.length() == 0 { _session_stores.append(MemoryStore()) }
+    st: SessionStore = _session_stores[0]
+    return st
+}
 
 ---
 Middleware for sessions — `app.use(web.sessions())`, then `req.session()`
-in handlers. Sessions live in the server's memory (they end when it
-restarts) and expire `minutes` after the visitor's last request (default:
-a week). `secret` signs the cookie; by default a random one is made when
-the server starts. `secure=true` sends the cookie over HTTPS only.
+in handlers. They expire `minutes` after the visitor's last request
+(default: a week).
+  `store`  — where they're kept: `web.memory_store()` (the default: the
+             server's memory, they end when it restarts) or
+             `web.sqlite_store(...)` (they last across restarts)
+  `secret` — signs the cookie. Default: $QUIRK_SESSION_SECRET if it's set,
+             else one the store keeps (sqlite_store), else a new random one
+             each start. Give one (or the variable) when several servers
+             share the sessions.
+  `secure` — send the cookie over HTTPS only (true in production).
 ---
-define sessions(secret: String = "", minutes: Int = 10080, cookie: String = "quirk_session", secure: Bool = false) -> Callable {
-    _session_conf["secret"] = secret != "" ? secret : crypto.random_hex(32)
+define sessions(secret: String = "", minutes: Int = 10080, cookie: String = "quirk_session", secure: Bool = false, store: SessionStore = null) -> Callable {
+    _session_stores.clear()
+    if store != null {
+        _session_stores.append(store)
+    } else {
+        _session_stores.append(MemoryStore())
+    }
+    key := secret
+    if key == "" { key = sys.getenv("QUIRK_SESSION_SECRET") }
+    if key == "" { key = _session_store().secret() }
+    if key == "" { key = crypto.random_hex(32) }
+    _session_conf["secret"] = key
     _session_conf["minutes"] = minutes
     _session_conf["cookie"] = cookie
     _session_conf["secure"] = secure
@@ -819,30 +999,28 @@ define _session_sign(id: String) -> String {
 
 // The session the request's cookie names, or a new one (stored once it has values).
 define _session_for(r: Request) -> Session {
+    store := _session_store()
     now := now() * 1000
     ttl := Int(_session_conf["minutes"]) * 60 * 1000
     if now - Int(_session_sweep[0]) > 60000 {
         _session_sweep[0] = now
-        stale := []
-        for k in _session_store.keys() {
-            key: String = k
-            old: Session = _session_store[key]
-            if now - old._seen > ttl { stale.append(key) }
-        }
-        for k in stale { _session_store.remove(String(k)) }
+        store.sweep(now - ttl)
     }
     raw := r.cookie(String(_session_conf["cookie"]))
     dot := raw.find(".")
     if dot > 0 {
         id := raw.substring(0, dot)
         // (constant time: with ==, the time taken tells how much of a forged signature was right)
-        if crypto.equal(_session_sign(id), raw) and _session_store.has(id) {
-            s: Session = _session_store[id]
-            if now - s._seen <= ttl {
-                s._seen = now
-                return s
+        if crypto.equal(_session_sign(id), raw) {
+            found := store.load(id)
+            if found != null {
+                s: Session = found
+                if now - s._seen <= ttl {
+                    s._seen = now
+                    return s
+                }
+                store.remove(id)
             }
-            _session_store.remove(id)
         }
     }
     s := Session(crypto.random_hex(16))
@@ -850,7 +1028,8 @@ define _session_for(r: Request) -> Session {
     return s
 }
 
-// After the handler: store a new session that got values, (re)send or clear the cookie.
+// After the handler: store a new session that got values (or a changed
+// one), (re)send or clear the cookie.
 define _session_after(s: Session, rs: Response) -> void {
     name := String(_session_conf["cookie"])
     secure: Bool = _session_conf["secure"]
@@ -859,7 +1038,7 @@ define _session_after(s: Session, rs: Response) -> void {
         return
     }
     if s._new and s.data.keys().length() == 0 { return }
-    _session_store[s.id] = s
+    _session_store().save(s)
     if s._new or s._renamed {
         rs.cookie(name, _session_sign(s.id), max_age=Int(_session_conf["minutes"]) * 60, secure=secure)
         s._new = false
@@ -867,9 +1046,9 @@ define _session_after(s: Session, rs: Response) -> void {
     }
 }
 
---- How many sessions the server holds. ---
+--- How many sessions the store holds. ---
 define session_count() -> Int {
-    return _session_store.keys().length()
+    return _session_store().count()
 }
 
 --- Log `user` in (any value: a name, a Map, a struct): a new session id, then `user` stored. ---
