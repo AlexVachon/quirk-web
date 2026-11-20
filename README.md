@@ -112,6 +112,11 @@ app.on_error(fn(err, req, res) { res.status(500).json({"error": err.message}) })
 app.on_not_found(fn(req, res) { res.status(404).render("404.html") })
 ```
 
+A `Router` can carry them too — `router.on_not_found(…)`, `router.on_error(…)`
+— and an app mounting it uses them unless it has its own (live's
+`router.not_found(Page)` works this way). A handler that doesn't answer
+leaves the request to the next one, then to the default.
+
 ## Sessions and login
 
 ```quirk

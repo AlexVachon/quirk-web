@@ -657,10 +657,33 @@ A group of routes and middleware to mount in an app under a prefix:
 struct Router {
     routes: List
     middleware: List
+    not_found_handler: Callable    // on_not_found (an app mounting it uses it)
+    error_handler: Callable        // on_error (likewise)
 
     define __init(self) -> void {
         self.routes = []
         self.middleware = []
+        self.not_found_handler = null
+        self.error_handler = null
+    }
+
+    ---
+    What the app answers when no route matches — `handler(req, res)` — once
+    this router is mounted (unless the app has its own `on_not_found`).
+    ---
+    define on_not_found(self, handler: Callable) -> Router {
+        self.not_found_handler = handler
+        return self
+    }
+
+    ---
+    What the app does when a handler throws — `handler(err, req, res)` —
+    once this router is mounted (unless the app has its own `on_error`). A
+    handler that doesn't answer leaves it to the default.
+    ---
+    define on_error(self, handler: Callable) -> Router {
+        self.error_handler = handler
+        return self
     }
 
     --- Handle `method` requests to `pattern` ("/users/:id", "/files/*path"). ---
@@ -1103,6 +1126,7 @@ struct App {
     _router: Router
     _on_error: Callable
     _on_not_found: Callable
+    _mounted: List          // the routers mounted: their on_not_found / on_error
     _running: Bool
     _port: Int
     _host: String
@@ -1114,6 +1138,7 @@ struct App {
         self._router = Router()
         self._on_error = null
         self._on_not_found = null
+        self._mounted = []
         self._running = false
         self._port = 0
         self._host = ""
@@ -1145,6 +1170,7 @@ struct App {
 
     --- Add a Router's routes and middleware under `prefix` ("/api"). ---
     define mount(self, prefix: String, router: Router) -> App {
+        self._mounted.append(router)
         for m in router.middleware {
             entry: List = m
             p: String = entry[0]
@@ -1196,9 +1222,16 @@ struct App {
     }
 
     define _fail(self, e: Exception, status: Int, req: Request, res: Response) -> void {
-        if self._on_error != null {
+        handlers := []
+        if self._on_error != null { handlers.append(self._on_error) }
+        for m in self._mounted {
+            rt: Router = m
+            if rt.error_handler != null { handlers.append(rt.error_handler) }
+        }
+        for h in handlers {
+            handler: Callable = h
             try {
-                self._on_error(e, req, res)
+                handler(e, req, res)
                 if res.sent { return }
             } catch (e2: Exception) {
                 print("web: error handler failed: " + e2.message)
@@ -1240,6 +1273,14 @@ struct App {
         if self._on_not_found != null {
             self._on_not_found(req, res)
             return
+        }
+        for m in self._mounted {
+            mounted: Router = m
+            if mounted.not_found_handler != null {
+                h: Callable = mounted.not_found_handler
+                h(req, res)
+                if res.sent { return }
+            }
         }
         res.status(404).text("Not Found")
     }
